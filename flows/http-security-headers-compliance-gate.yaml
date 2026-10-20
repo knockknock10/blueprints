@@ -1,0 +1,424 @@
+id: http-security-headers-compliance-gate
+namespace: company.security
+description: |
+  Audit the HTTP security headers returned by a public HTTPS website before release. The flow
+  checks required security-header presence, HSTS max-age and optional includeSubDomains, response
+  status, and common unsafe Content-Security-Policy directives. It creates a JSON evidence report,
+  alerts Slack when policy fails, and can optionally archive metadata in S3.
+
+inputs:
+  - id: target_url
+    type: STRING
+    displayName: Public HTTPS URL
+    defaults: https://www.mozilla.org
+    description: HTTPS URL to inspect. Only public DNS destinations and same-host HTTPS redirects are followed.
+  - id: required_headers
+    type: STRING
+    displayName: Required security headers
+    defaults: strict-transport-security,x-content-type-options,referrer-policy,content-security-policy
+    description: Comma-separated list of supported security headers that must be present.
+  - id: minimum_hsts_days
+    type: INT
+    displayName: Minimum HSTS max-age in days
+    defaults: 180
+    description: Block if HSTS max-age is shorter than this threshold.
+  - id: require_hsts_include_subdomains
+    type: BOOL
+    displayName: Require HSTS includeSubDomains
+    defaults: false
+    description: Block when HSTS lacks the includeSubDomains directive.
+  - id: warn_on_unsafe_csp
+    type: BOOL
+    displayName: Warn on unsafe CSP directives
+    defaults: true
+    description: Flag unsafe-inline or unsafe-eval in Content-Security-Policy as warnings rather than assuming a full CSP analysis.
+  - id: archive_report
+    type: BOOL
+    displayName: Archive report to S3
+    defaults: false
+    description: Store the JSON audit report in S3. AWS credentials are required only when enabled.
+  - id: evidence_bucket
+    type: STRING
+    displayName: S3 evidence bucket
+    defaults: my-http-security-audit-evidence
+    description: Existing S3 bucket for optional evidence retention.
+  - id: evidence_prefix
+    type: STRING
+    displayName: S3 evidence prefix
+    defaults: http-security-header-audits
+    description: Object key prefix for security-header reports.
+  - id: aws_region
+    type: STRING
+    displayName: AWS region
+    defaults: eu-west-1
+    description: Region containing the evidence bucket.
+
+triggers:
+  - id: weekly_security_header_audit
+    type: io.kestra.plugin.core.trigger.Schedule
+    description: Recheck the configured HTTPS site's security-header posture weekly. Enable after reviewing policy thresholds.
+    cron: "0 7 * * 1"
+    disabled: true
+
+tasks:
+  - id: validate_public_target
+    type: io.kestra.plugin.scripts.python.Script
+    description: Validate the HTTPS target, allowed required-header names, HSTS thresholds and public DNS resolution before connecting.
+    containerImage: python:3.12-slim
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+    env:
+      TARGET_URL: "{{ inputs.target_url }}"
+      REQUIRED_HEADERS: "{{ inputs.required_headers }}"
+      MINIMUM_HSTS_DAYS: "{{ inputs.minimum_hsts_days }}"
+    script: |
+      import ipaddress
+      import os
+      import re
+      import socket
+      from urllib.parse import urlparse
+
+      target = os.environ.get("TARGET_URL", "").strip()
+      required_text = os.environ.get("REQUIRED_HEADERS", "")
+      minimum_days = int(os.environ.get("MINIMUM_HSTS_DAYS", "180"))
+      parsed = urlparse(target)
+
+      if parsed.scheme.lower() != "https" or not parsed.hostname:
+          raise ValueError("target_url must be an absolute HTTPS URL")
+      if parsed.username or parsed.password or parsed.fragment:
+          raise ValueError("target_url must not contain credentials or a fragment")
+      if parsed.port not in (None, 443):
+          raise ValueError("target_url must use the standard HTTPS port")
+      if not re.fullmatch(r"[A-Za-z0-9.-]+", parsed.hostname) or ".." in parsed.hostname:
+          raise ValueError("target_url hostname is not a valid public DNS hostname")
+      if not 0 <= minimum_days <= 3650:
+          raise ValueError("minimum_hsts_days must be between 0 and 3650")
+
+      supported = {
+          "strict-transport-security", "content-security-policy",
+          "x-content-type-options", "referrer-policy", "x-frame-options",
+          "permissions-policy", "cross-origin-opener-policy",
+          "cross-origin-resource-policy", "cross-origin-embedder-policy",
+      }
+      required = [item.strip().lower() for item in required_text.split(",") if item.strip()]
+      if not required or len(required) != len(set(required)) or set(required) - supported:
+          raise ValueError("required_headers must be a unique comma-separated subset of supported security header names")
+
+      answers = socket.getaddrinfo(parsed.hostname, 443, type=socket.SOCK_STREAM)
+      addresses = sorted({answer[4][0] for answer in answers})
+      if not addresses:
+          raise ValueError("target hostname resolved to no addresses")
+      for address in addresses:
+          ip = ipaddress.ip_address(address.split("%", 1)[0])
+          if not ip.is_global:
+              raise ValueError(f"refusing non-public address returned for the target host: {address}")
+
+      print(f"Validated public HTTPS target {parsed.hostname}; {len(required)} required header(s), HSTS minimum {minimum_days} day(s).")
+
+  - id: audit_security_headers
+    type: io.kestra.plugin.scripts.python.Script
+    description: Fetch response headers with same-host HTTPS-only redirects, redact unrelated headers, evaluate the configured policy and emit JSON evidence.
+    containerImage: python:3.12-slim
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+    dependencies:
+      - kestra
+    env:
+      TARGET_URL: "{{ inputs.target_url }}"
+      REQUIRED_HEADERS: "{{ inputs.required_headers }}"
+      MINIMUM_HSTS_DAYS: "{{ inputs.minimum_hsts_days }}"
+      REQUIRE_HSTS_INCLUDE_SUBDOMAINS: "{{ inputs.require_hsts_include_subdomains }}"
+      WARN_ON_UNSAFE_CSP: "{{ inputs.warn_on_unsafe_csp }}"
+    outputFiles:
+      - http-security-headers-audit.json
+    script: |
+      import ipaddress
+      import json
+      import os
+      import re
+      import socket
+      import urllib.error
+      import urllib.parse
+      import urllib.request
+      from datetime import datetime, timezone
+
+      from kestra import Kestra
+
+      target_url = os.environ["TARGET_URL"].strip()
+      initial = urllib.parse.urlparse(target_url)
+      original_host = initial.hostname.lower()
+      required = [item.strip().lower() for item in os.environ["REQUIRED_HEADERS"].split(",") if item.strip()]
+      minimum_hsts_days = int(os.environ.get("MINIMUM_HSTS_DAYS", "180"))
+      require_subdomains = os.environ.get("REQUIRE_HSTS_INCLUDE_SUBDOMAINS", "false").lower() == "true"
+      warn_unsafe_csp = os.environ.get("WARN_ON_UNSAFE_CSP", "true").lower() == "true"
+
+      def check_public_host(host):
+          answers = socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)
+          addresses = {answer[4][0] for answer in answers}
+          if not addresses:
+              raise ValueError(f"{host} resolved to no IP addresses")
+          for address in addresses:
+              ip = ipaddress.ip_address(address.split("%", 1)[0])
+              if not ip.is_global:
+                  raise ValueError(f"refusing non-public redirect address {address}")
+
+      class SameHostHTTPSRedirectHandler(urllib.request.HTTPRedirectHandler):
+          def redirect_request(self, req, fp, code, msg, headers, newurl):
+              parsed = urllib.parse.urlparse(newurl)
+              if (
+                  parsed.scheme.lower() != "https"
+                  or parsed.hostname is None
+                  or parsed.hostname.lower() != original_host
+                  or parsed.port not in (None, 443)
+              ):
+                  raise urllib.error.URLError("redirect left the original HTTPS hostname or port")
+              check_public_host(parsed.hostname)
+              return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+      check_public_host(original_host)
+      opener = urllib.request.build_opener(SameHostHTTPSRedirectHandler())
+      request = urllib.request.Request(
+          target_url,
+          headers={
+              "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
+              "User-Agent": "Kestra-HTTP-Security-Headers-Audit/1.0",
+          },
+          method="GET",
+      )
+      response = None
+      try:
+          response = opener.open(request, timeout=15)
+      except urllib.error.HTTPError as exc:
+          response = exc
+
+      try:
+          final_url = response.geturl()
+          status_code = int(response.code)
+          headers = response.headers
+          raw_headers = {key.lower(): value.strip() for key, value in headers.items()}
+      finally:
+          response.close()
+
+      observed_names = {
+          "strict-transport-security", "content-security-policy", "x-content-type-options",
+          "referrer-policy", "x-frame-options", "permissions-policy",
+          "cross-origin-opener-policy", "cross-origin-resource-policy",
+          "cross-origin-embedder-policy",
+      }
+      observed_headers = {name: raw_headers[name] for name in sorted(observed_names) if raw_headers.get(name)}
+      findings = []
+
+      def add(code, severity, message):
+          findings.append({"code": code, "severity": severity, "message": message})
+
+      if not 200 <= status_code < 400:
+          add("HTTP_STATUS_NOT_SUCCESSFUL", "BLOCK", f"Target returned HTTP {status_code}.")
+      for header_name in required:
+          if not observed_headers.get(header_name):
+              add("REQUIRED_HEADER_MISSING", "BLOCK", f"Required security header is missing: {header_name}.")
+
+      hsts = observed_headers.get("strict-transport-security", "")
+      hsts_age = None
+      hsts_directives = [token.strip().lower() for token in hsts.split(";") if token.strip()]
+      for directive in hsts_directives:
+          match = re.fullmatch(r"max-age\s*=\s*(\d+)", directive)
+          if match:
+              hsts_age = int(match.group(1))
+              break
+      if hsts:
+          if hsts_age is None:
+              add("HSTS_MAX_AGE_INVALID", "BLOCK", "Strict-Transport-Security has no parseable max-age directive.")
+          elif hsts_age < minimum_hsts_days * 86400:
+              add("HSTS_MAX_AGE_TOO_SHORT", "BLOCK", f"HSTS max-age is {hsts_age} seconds; policy requires at least {minimum_hsts_days} day(s).")
+          if require_subdomains and "includesubdomains" not in hsts_directives:
+              add("HSTS_INCLUDE_SUBDOMAINS_MISSING", "BLOCK", "HSTS does not contain includeSubDomains as required by policy.")
+
+      xcto = observed_headers.get("x-content-type-options", "")
+      if xcto and xcto.lower() != "nosniff":
+          add("X_CONTENT_TYPE_OPTIONS_INVALID", "BLOCK", "X-Content-Type-Options should be nosniff.")
+
+      referrer = observed_headers.get("referrer-policy", "")
+      valid_referrer_values = {
+          "no-referrer", "no-referrer-when-downgrade", "origin", "origin-when-cross-origin",
+          "same-origin", "strict-origin", "strict-origin-when-cross-origin", "unsafe-url",
+      }
+      if referrer and referrer.lower().strip() not in valid_referrer_values:
+          add("REFERRER_POLICY_UNRECOGNIZED", "WARN", "Referrer-Policy value is not one of the common standard policy tokens.")
+
+      csp = observed_headers.get("content-security-policy", "")
+      if csp and warn_unsafe_csp:
+          unsafe = [token for token in ("'unsafe-inline'", "'unsafe-eval'") if token in csp.lower()]
+          if unsafe:
+              add("CSP_UNSAFE_SCRIPT_DIRECTIVE", "WARN", "Content-Security-Policy contains potentially unsafe directive token(s): " + ", ".join(unsafe))
+
+      blocking = [item for item in findings if item["severity"] == "BLOCK"]
+      warnings = [item for item in findings if item["severity"] == "WARN"]
+      verdict = "FAIL" if blocking else ("PASS_WITH_WARNINGS" if warnings else "PASS")
+      report = {
+          "schemaVersion": 1,
+          "checkedAt": datetime.now(timezone.utc).isoformat(),
+          "requestedUrl": target_url,
+          "finalUrl": final_url,
+          "httpStatus": status_code,
+          "requiredHeaders": required,
+          "observedSecurityHeaders": observed_headers,
+          "hstsMaxAgeSeconds": hsts_age,
+          "minimumHstsDays": minimum_hsts_days,
+          "requireHstsIncludeSubdomains": require_subdomains,
+          "findings": findings,
+          "blockingFindingCount": len(blocking),
+          "warningCount": len(warnings),
+          "verdict": verdict,
+          "scopeNote": "This audit checks response headers only for this URL and redirect path. It does not crawl every route, evaluate a complete CSP policy, or guarantee absence of application vulnerabilities.",
+      }
+      with open("http-security-headers-audit.json", "w", encoding="utf-8") as target:
+          json.dump(report, target, indent=2, ensure_ascii=False)
+
+      print(f"HTTP security-header audit: {final_url} verdict={verdict}; HTTP {status_code}, checked={len(required)}, observed={len(observed_headers)}, blocking={len(blocking)}, warnings={len(warnings)}")
+      Kestra.outputs({
+          "requested_url": target_url,
+          "final_url": final_url,
+          "http_status": status_code,
+          "observed_headers": observed_headers,
+          "hsts_max_age_seconds": hsts_age if hsts_age is not None else 0,
+          "blocking_finding_count": len(blocking),
+          "warning_count": len(warnings),
+          "verdict": verdict,
+          "findings": findings,
+      })
+
+  - id: optionally_archive_report
+    type: io.kestra.plugin.core.flow.If
+    description: Optionally archive the response-header audit evidence to S3.
+    condition: "{{ inputs.archive_report }}"
+    then:
+      - id: upload_security_header_report
+        type: io.kestra.plugin.aws.s3.Upload
+        description: Store the selected security-header metadata and policy findings in S3.
+        accessKeyId: "{{ secret('AWS_ACCESS_KEY_ID') }}"
+        secretKeyId: "{{ secret('AWS_SECRET_ACCESS_KEY') }}"
+        region: "{{ inputs.aws_region }}"
+        bucket: "{{ inputs.evidence_bucket }}"
+        from: "{{ outputs.audit_security_headers.outputFiles['http-security-headers-audit.json'] }}"
+        key: "{{ inputs.evidence_prefix }}/{{ inputs.target_url | replace('https://', '') | replace('/', '_') }}/http-security-headers-audit.json"
+
+  - id: enforce_header_policy
+    type: io.kestra.plugin.core.flow.If
+    description: Fail closed when any required header, HSTS threshold or response-status rule fails.
+    condition: "{{ outputs.audit_security_headers.vars.verdict == 'FAIL' }}"
+    then:
+      - id: alert_header_policy_failure
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        description: Notify the site owner about missing or non-compliant security headers.
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        payload: |-
+          {{
+            {
+              "text": ":rotating_light: HTTP security-header policy failed\nURL: " ~ outputs.audit_security_headers.vars.final_url ~
+                "\nStatus: " ~ outputs.audit_security_headers.vars.http_status ~
+                "\nFindings: " ~ (outputs.audit_security_headers.vars.findings | toJson) ~
+                "\nExecution: " ~ execution.id ~
+                "\nReview http-security-headers-audit.json before release."
+            } | toJson
+          }}
+      - id: fail_header_policy
+        type: io.kestra.plugin.core.execution.Fail
+        description: Stop the release workflow when configured HTTP security-header policy fails.
+        errorMessage: "HTTP security-header compliance failed for {{ outputs.audit_security_headers.vars.final_url }}. Review http-security-headers-audit.json."
+    else:
+      - id: log_header_policy_verdict
+        type: io.kestra.plugin.core.log.Log
+        level: INFO
+        message: "HTTP security-header policy {{ outputs.audit_security_headers.vars.verdict }} for {{ outputs.audit_security_headers.vars.final_url }}; HTTP {{ outputs.audit_security_headers.vars.http_status }}."
+
+errors:
+  - id: alert_header_audit_failure
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    description: Notify the owner if DNS validation, HTTP access, parsing or orchestration fails.
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    payload: |-
+      {{
+        {
+          "text": ":warning: HTTP security-header audit execution failed\nURL: " ~ inputs.target_url ~
+            "\nExecution: " ~ execution.id ~
+            "\nInspect task logs; a failed audit must not be treated as compliant."
+        } | toJson
+      }}
+
+extend:
+  title: HTTP Security Headers Compliance Gate
+  metaTitle: HTTP Security Headers Compliance Gate | Kestra
+  shortDescription: Inspect public HTTPS response security headers, enforce an HSTS baseline, and produce evidence before releases.
+  metaDescription: Audit HTTPS security headers, HSTS max-age and common CSP risk signals before release, with a JSON report, Slack alerts and optional S3 evidence.
+  description: |
+    Evaluate the security headers returned by a public HTTPS website before release or deployment. The flow validates DNS and URL safety, fetches the target using same-host HTTPS redirects, checks required response headers, validates HSTS max-age and optional includeSubDomains, and flags common unsafe CSP directives as warnings. It writes a JSON report, routes blocking findings to Slack and a failing task, and can optionally archive the result to S3.
+
+    ## How it works
+
+    1. The validation task checks the HTTPS URL, required-header names, HSTS threshold and public DNS resolution.
+    2. The audit task retrieves the target response headers without crawling the site or downloading its full page body.
+    3. The script checks required headers, parses Strict-Transport-Security max-age, validates nosniff and common Referrer-Policy values, and warns on unsafe CSP token usage.
+    4. It writes http-security-headers-audit.json with the observed security headers and a policy verdict.
+    5. The optional S3 branch archives evidence; the policy If alerts and fails when blocking findings exist.
+
+    ## What you get
+
+    - A JSON report with the final URL, HTTP status, selected header values, HSTS max-age, findings and verdict.
+    - Policy enforcement for missing headers and insufficient HSTS max-age.
+    - Warnings for common unsafe CSP directives and unrecognized Referrer-Policy values.
+    - Optional Slack alerts and S3 evidence retention.
+
+    ## Who it's for
+
+    - Application security teams validating public-facing websites.
+    - Platform engineering teams requiring a baseline of HTTP security headers before releases.
+    - SRE teams checking for security-control regressions after reverse-proxy or CDN changes.
+
+    ## Why orchestrate this with Kestra
+
+    Kestra records each check as a repeatable execution, exposes thresholds as flow inputs, schedules audits and routes policy failures to a visible alert and a failing task that downstream release automation can depend on.
+
+    ## Prerequisites
+
+    - A Kestra 2.x worker with Docker enabled for Python Script tasks.
+    - Network access from the task container to the target HTTPS hostname.
+    - A Slack incoming webhook for failure notifications.
+    - An S3 bucket and write-capable AWS credentials only when optional report archival is enabled.
+
+    ### Secrets
+
+    - SLACK_WEBHOOK_URL: Slack incoming webhook used for policy failures and execution errors.
+    - AWS_ACCESS_KEY_ID: optional AWS access key used only when S3 archival is enabled.
+    - AWS_SECRET_ACCESS_KEY: optional AWS secret key used only when S3 archival is enabled.
+
+    ## Quick start
+
+    1. Import the flow and begin with target_url=https://www.mozilla.org.
+    2. Execute it manually and review http-security-headers-audit.json before using the flow as a release gate.
+    3. Tune required_headers and minimum_hsts_days to fit the site's architecture and security baseline.
+    4. Configure SLACK_WEBHOOK_URL before relying on blocking alerts.
+    5. Enable the weekly schedule only after checking the initial findings and confirming the alert destination.
+
+    ## How to extend
+
+    - Add a site-specific allowlist for legacy headers and document expiration dates for exceptions.
+    - Compare the header report against a policy file versioned in Git.
+    - Add multiple target URLs for login, API and static-content endpoints rather than assuming one route represents the whole website.
+    - Send results to a security dashboard or ticket system for trend analysis.
+
+    ## Links
+
+    - [OWASP Secure Headers Project](https://owasp.org/www-project-secure-headers/)
+    - [MDN: Strict-Transport-Security](https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Strict-Transport-Security)
+    - [MDN: Content-Security-Policy](https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Content-Security-Policy)
+    - [MDN: X-Content-Type-Options](https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/X-Content-Type-Options)
+    - [Kestra Python Script plugin](https://kestra.io/plugins/plugin-scripts/python)
+    - [Kestra Slack plugin](https://kestra.io/plugins/plugin-slack/slackincomingwebhook)
+    - [Kestra AWS S3 plugin](https://kestra.io/plugins/plugin-aws/s3)
+  tags:
+    - Infrastructure
+  subTags:
+    - Policy & Compliance
+    - Monitoring & Alerting
+  ee: false
+  demo: false
