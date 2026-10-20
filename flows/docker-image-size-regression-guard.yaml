@@ -23,7 +23,7 @@ inputs:
   - id: repository
     type: STRING
     displayName: Image repository
-    description: Repo name stored in the baseline metadata(without tag).
+    description: Expected image repository stored in the baseline metadata, without a tag or digest.
     defaults: ghcr.io/my-org/my-app
 
   - id: baseline_key
@@ -54,6 +54,17 @@ inputs:
     defaults: false
 
 tasks:
+  - id: validate_image_repository
+    type: io.kestra.plugin.core.execution.Assert
+    description: Reject a webhook image from a different repository before Docker calls or baseline access.
+    errorMessage: >-
+      Image reference '{{ trigger.body.image ?? inputs.image }}' does not match
+      configured repository '{{ inputs.repository }}'. Use the same repository
+      with an optional tag or digest.
+    conditions:
+      - "{{ inputs.repository != '' }}"
+      - "{{ (trigger.body.image ?? inputs.image) == inputs.repository or ((trigger.body.image ?? inputs.image) | startsWith(inputs.repository ~ ':')) or ((trigger.body.image ?? inputs.image) | startsWith(inputs.repository ~ '@')) }}"
+
   - id: ensure_image
     type: io.kestra.plugin.core.flow.If
     condition: "{{ inputs.pull_image }}"
@@ -218,20 +229,24 @@ extend:
   description: |
     A central, provider-agnostic quality gate for container images. Any ci
     system (GitHub Actions, GitLab CI, Jenkins, CircleCI, etc.) POST the pushed
-    image to a kestra webhook. The flow pull the artifact, measure it with
-    `ImageLs`, and compares the size to an **approved** baseline in KV. The
-    baseline is an explicit reference (`reset_baseline=true`), not the previous
-    execution. Regressions fail the execution; discord is notified once via the
-    `errors` block with the full report.
+    image to a kestra webhook. Before pulling or inspecting it, the flow checks
+    that the selected image belongs to the configured repository; tag and digest
+    suffixes are allowed, but a different repository is rejected. The flow then
+    measures the artifact with `ImageLs` and compares its size to an **approved**
+    baseline in KV. The baseline is an explicit reference (`reset_baseline=true`),
+    not the previous execution. Regressions fail the execution; discord is
+    notified once via the `errors` block with the full report.
 
     ## How it works
 
     1. Webhook receives `{"image": "ghcr.io/my-org/my-app:abc123"}` from any CI.
-    2. optional `Pull`, then `ImageLs` and `Assert`.
-    3. `reset_baseline=true` saves json metadata (`image`, `size_bytes`, `approved_at`).
-    4. otherwise `assess` compares current size against the baseline using **both**
+    2. `validate_image_repository` rejects an image reference that does not match
+       the configured repository, before Docker access or baseline mutation.
+    3. Optional `Pull`, then `ImageLs` and an existence assertion.
+    4. `reset_baseline=true` saves JSON metadata (`image`, `size_bytes`, `approved_at`).
+    5. Otherwise `assess` compares current size against the baseline using **both**
        `max_increase_percent` and `max_increase_mb`.
-    5. On breach: `Fail` with a report; `errors` sends one discord alert.
+    6. On breach: `Fail` with a report; `errors` sends one Discord alert.
 
     ## Example
 
