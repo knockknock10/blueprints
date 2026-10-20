@@ -408,7 +408,7 @@ extend:
   title: npm Lockfile Integrity and Manifest Consistency Gate
   metaTitle: npm Lockfile Integrity and Manifest Consistency Gate | Kestra
   shortDescription: Verify package.json and package-lock.json agree and audit npm lockfile versions, HTTPS resolutions, SHA-512 integrity declarations and immutable Git pins.
-  metaDescription: Gate npm releases on manifest-to-lock consistency, modern package-lock versions, HTTPS artifact URLs, SHA-512 integrity metadata and immutable Git dependencies.
+  metaDescription: Gate npm releases on manifest-lock consistency, modern package-lock versions, HTTPS artifact URLs, SHA-512 integrity metadata and immutable Git dependencies.
   description: |
     Check a public Node.js repository's package.json and package-lock.json before running dependency installation or promoting a release. The workflow compares root metadata and direct dependency specifications, verifies a modern npm lockfile structure, reviews registry resolution URLs and integrity declarations, and checks Git dependencies for immutable commit pins. It emits an evidence report, can archive it to S3, and fails closed when policy checks are not met.
 
