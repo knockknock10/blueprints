@@ -98,6 +98,8 @@ tasks:
       REPORT_MISSING_PINS: "{{ inputs.report_missing_pins }}"
     outputFiles:
       - host-key-audit.json
+    dependencies:
+      - kestra
     script: |
       import json
       import os
