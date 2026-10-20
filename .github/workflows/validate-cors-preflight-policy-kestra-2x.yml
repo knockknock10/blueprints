@@ -115,8 +115,6 @@ jobs:
           # published metadata in this example mirror (reported as blocking findings).
           EXECUTION_HTTP_STATUS="$(curl -sS --retry 2 -u "$KESTRA_AUTH_USER:$KESTRA_AUTH_PASS" \
             -X POST http://127.0.0.1:8080/api/v1/main/executions/company.infrastructure/cors-preflight-policy-compliance-gate \
-            -H 'Content-Type: application/json' \
-            --data-binary '{}' \
             -o execution-created.json -w '%{http_code}')"
           echo "Execution creation HTTP status: $EXECUTION_HTTP_STATUS"
           if [ "$EXECUTION_HTTP_STATUS" -lt 200 ] || [ "$EXECUTION_HTTP_STATUS" -ge 300 ]; then
