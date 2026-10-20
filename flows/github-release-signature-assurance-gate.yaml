@@ -343,7 +343,7 @@ extend:
   title: GitHub Release Signature Assurance Gate
   metaTitle: GitHub Release Signature Assurance Gate | Kestra
   shortDescription: Inspect GitHub release tag and commit signature verification and optionally block releases that do not meet a repository's signing policy.
-  metaDescription: Audit latest GitHub releases for annotated tag and commit signature verification using GitHub's API, with configurable fail-closed enforcement and JSON evidence.
+  metaDescription: Audit GitHub releases for tag and commit signature status via GitHub's API, with optional fail-closed enforcement and JSON evidence.
   description: |
     Review the latest published release of a public GitHub repository before it is promoted to production. The flow resolves the release's tag reference through annotated tag objects to an immutable commit, reads GitHub's reported tag and commit verification metadata, and compares those observations to an explicit signing policy. It writes a JSON report with verification reasons, optionally stores that report in S3, and can alert Slack and fail when strict policy settings require a verified tag or commit.
 
