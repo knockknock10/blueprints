@@ -1,0 +1,451 @@
+id: oidc-discovery-jwks-integrity-gate
+namespace: company.security
+description: |
+  Validate a public OpenID Connect provider's discovery document and JSON Web Key Set before
+  onboarding or identity-platform changes. The flow checks issuer consistency, required HTTPS
+  endpoints, endpoint host allowlists, public JWK structure, duplicate key identifiers and signing
+  algorithms. It emits JSON evidence and can alert on blocking findings.
+
+inputs:
+  - id: issuer_url
+    type: STRING
+    displayName: OIDC issuer URL
+    defaults: https://accounts.google.com
+    description: Canonical HTTPS issuer URL from the identity provider configuration.
+  - id: allowed_endpoint_hosts
+    type: STRING
+    displayName: Allowed endpoint hostnames
+    defaults: accounts.google.com,oauth2.googleapis.com,openidconnect.googleapis.com,www.googleapis.com
+    description: Comma-separated public hostnames permitted for advertised OIDC endpoints and the JWKS URL.
+  - id: allowed_signing_algorithms
+    type: STRING
+    displayName: Allowed signing algorithms
+    defaults: RS256,ES256,ES384,PS256
+    description: Comma-separated signing algorithms accepted by local policy.
+  - id: minimum_jwks_key_count
+    type: INT
+    displayName: Minimum public JWK count
+    defaults: 1
+    description: Minimum number of public keys required in the JWKS response.
+  - id: require_unique_key_ids
+    type: BOOL
+    displayName: Require unique key identifiers
+    defaults: true
+    description: Block if two JWKS entries have the same non-empty kid value.
+  - id: archive_report
+    type: BOOL
+    displayName: Archive report to S3
+    defaults: false
+    description: Store the JSON OIDC posture report in S3. AWS credentials are required only when enabled.
+  - id: evidence_bucket
+    type: STRING
+    displayName: S3 evidence bucket
+    defaults: my-oidc-posture-evidence
+    description: Existing S3 bucket for optional evidence retention.
+  - id: evidence_prefix
+    type: STRING
+    displayName: S3 evidence prefix
+    defaults: oidc-discovery-audits
+    description: Object key prefix for provider posture reports.
+  - id: aws_region
+    type: STRING
+    displayName: AWS region
+    defaults: eu-west-1
+    description: Region containing the evidence bucket.
+
+triggers:
+  - id: weekly_oidc_provider_audit
+    type: io.kestra.plugin.core.trigger.Schedule
+    description: Recheck the OIDC discovery document and signing keys weekly. Enable after reviewing endpoint host and algorithm allowlists.
+    cron: "0 8 * * 1"
+    disabled: true
+
+tasks:
+  - id: validate_oidc_policy
+    type: io.kestra.plugin.scripts.python.Script
+    description: Validate the issuer URL, hostname allowlists, and algorithm policy before requesting provider metadata.
+    containerImage: python:3.12-slim
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+    env:
+      ISSUER_URL: "{{ inputs.issuer_url }}"
+      ALLOWED_ENDPOINT_HOSTS: "{{ inputs.allowed_endpoint_hosts }}"
+      ALLOWED_ALGORITHMS: "{{ inputs.allowed_signing_algorithms }}"
+      MINIMUM_KEY_COUNT: "{{ inputs.minimum_jwks_key_count }}"
+    script: |
+      import os
+      import re
+      from urllib.parse import urlparse
+
+      issuer = os.environ.get("ISSUER_URL", "").strip().rstrip("/")
+      parsed = urlparse(issuer)
+      if parsed.scheme.lower() != "https" or not parsed.hostname or parsed.username or parsed.password or parsed.query or parsed.fragment:
+          raise ValueError("issuer_url must be an absolute HTTPS issuer URL without credentials, query or fragment")
+      if parsed.port not in (None, 443):
+          raise ValueError("issuer_url must use standard HTTPS port 443")
+      if parsed.path not in {"", "/"}:
+          raise ValueError("this blueprint accepts a base issuer URL without a path prefix")
+      hosts = [item.strip().lower().rstrip(".") for item in os.environ.get("ALLOWED_ENDPOINT_HOSTS", "").split(",") if item.strip()]
+      if parsed.hostname.lower() not in hosts:
+          raise ValueError("issuer host must be included in allowed_endpoint_hosts")
+      if len(hosts) != len(set(hosts)) or any(not re.fullmatch(r"[a-z0-9.-]+", host) or ".." in host for host in hosts):
+          raise ValueError("allowed_endpoint_hosts must contain unique DNS hostnames")
+      algorithms = [item.strip().upper() for item in os.environ.get("ALLOWED_ALGORITHMS", "").split(",") if item.strip()]
+      if not algorithms or len(algorithms) != len(set(algorithms)):
+          raise ValueError("allowed_signing_algorithms must contain unique algorithm names")
+      minimum = int(os.environ.get("MINIMUM_KEY_COUNT", "1"))
+      if not 1 <= minimum <= 100:
+          raise ValueError("minimum_jwks_key_count must be between 1 and 100")
+
+      print(f"Validated OIDC issuer {issuer}; allowed hosts={len(hosts)}, signing algorithms={algorithms}, minimum keys={minimum}.")
+
+  - id: audit_oidc_discovery_and_jwks
+    type: io.kestra.plugin.scripts.python.Script
+    description: Fetch the real OIDC discovery and JWKS documents from explicitly allowed public hosts; validate required endpoints and public key structure without requesting tokens.
+    containerImage: python:3.12-slim
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+    dependencies:
+      - kestra
+    env:
+      ISSUER_URL: "{{ inputs.issuer_url }}"
+      ALLOWED_ENDPOINT_HOSTS: "{{ inputs.allowed_endpoint_hosts }}"
+      ALLOWED_ALGORITHMS: "{{ inputs.allowed_signing_algorithms }}"
+      MINIMUM_KEY_COUNT: "{{ inputs.minimum_jwks_key_count }}"
+      REQUIRE_UNIQUE_KEY_IDS: "{{ inputs.require_unique_key_ids }}"
+    outputFiles:
+      - oidc-provider-audit.json
+    script: |
+      import base64
+      import ipaddress
+      import json
+      import os
+      import re
+      import socket
+      import urllib.error
+      import urllib.parse
+      import urllib.request
+      from datetime import datetime, timezone
+
+      from kestra import Kestra
+
+      issuer_url = os.environ["ISSUER_URL"].strip().rstrip("/")
+      issuer_host = urllib.parse.urlparse(issuer_url).hostname.lower()
+      allowed_hosts = {item.strip().lower().rstrip(".") for item in os.environ["ALLOWED_ENDPOINT_HOSTS"].split(",") if item.strip()}
+      allowed_algorithms = {item.strip().upper() for item in os.environ["ALLOWED_ALGORITHMS"].split(",") if item.strip()}
+      minimum_key_count = int(os.environ.get("MINIMUM_KEY_COUNT", "1"))
+      require_unique_kids = os.environ.get("REQUIRE_UNIQUE_KEY_IDS", "true").lower() == "true"
+
+      def ensure_public_dns(host):
+          answers = {item[4][0] for item in socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)}
+          if not answers:
+              raise ValueError(f"{host} resolved to no IP addresses")
+          for address in answers:
+              ip = ipaddress.ip_address(address.split("%", 1)[0])
+              if not ip.is_global:
+                  raise ValueError(f"refusing non-public IP address {address} for {host}")
+
+      class AllowlistedHTTPSRedirectHandler(urllib.request.HTTPRedirectHandler):
+          def __init__(self, permitted_host):
+              super().__init__()
+              self.permitted_host = permitted_host.lower()
+
+          def redirect_request(self, req, fp, code, msg, headers, newurl):
+              parsed = urllib.parse.urlparse(newurl)
+              if (
+                  parsed.scheme.lower() != "https"
+                  or parsed.hostname is None
+                  or parsed.hostname.lower() != self.permitted_host
+                  or parsed.port not in (None, 443)
+              ):
+                  raise urllib.error.URLError("redirect left the permitted HTTPS hostname or port")
+              ensure_public_dns(parsed.hostname)
+              return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+      def fetch_json(url, expected_host, max_bytes=2_000_000):
+          parsed = urllib.parse.urlparse(url)
+          if parsed.scheme.lower() != "https" or parsed.hostname is None or parsed.hostname.lower() != expected_host.lower():
+              raise ValueError("requested JSON URL is not HTTPS on its expected allowlisted host")
+          if expected_host.lower() not in allowed_hosts:
+              raise ValueError(f"endpoint host {expected_host} is not in allowed_endpoint_hosts")
+          ensure_public_dns(expected_host)
+          opener = urllib.request.build_opener(AllowlistedHTTPSRedirectHandler(expected_host))
+          request = urllib.request.Request(
+              url,
+              headers={"Accept": "application/json", "User-Agent": "Kestra-OIDC-Discovery-JWKS-Audit/1.0"},
+              method="GET",
+          )
+          with opener.open(request, timeout=20) as response:
+              final = urllib.parse.urlparse(response.geturl())
+              if response.status != 200:
+                  raise RuntimeError(f"{url} returned HTTP {response.status}")
+              if final.scheme.lower() != "https" or final.hostname is None or final.hostname.lower() != expected_host.lower():
+                  raise ValueError("final response URL is outside the expected HTTPS host")
+              body = response.read(max_bytes + 1)
+              if len(body) > max_bytes:
+                  raise ValueError(f"JSON response exceeded {max_bytes} bytes")
+              return json.loads(body.decode("utf-8")), response.headers
+
+      findings = []
+      def add(code, severity, message):
+          findings.append({"code": code, "severity": severity, "message": message})
+
+      discovery_url = issuer_url + "/.well-known/openid-configuration"
+      discovery, discovery_headers = fetch_json(discovery_url, issuer_host)
+      discovered_issuer = str(discovery.get("issuer") or "").rstrip("/")
+      if discovered_issuer != issuer_url:
+          add("ISSUER_MISMATCH", "BLOCK", f"Discovery issuer '{discovered_issuer}' does not exactly match expected issuer '{issuer_url}'.")
+      if not isinstance(discovery.get("response_types_supported"), list) or not discovery.get("response_types_supported"):
+          add("RESPONSE_TYPES_MISSING", "WARN", "Discovery document has no non-empty response_types_supported list.")
+
+      required_endpoint_fields = ["authorization_endpoint", "token_endpoint", "jwks_uri"]
+      endpoint_summary = {}
+      for field in required_endpoint_fields:
+          value = discovery.get(field)
+          parsed = urllib.parse.urlparse(value or "")
+          if parsed.scheme.lower() != "https" or not parsed.hostname or parsed.username or parsed.password or parsed.port not in (None, 443):
+              add("ENDPOINT_URL_INVALID", "BLOCK", f"Required endpoint {field} is missing or is not a standard-port HTTPS URL.")
+              endpoint_summary[field] = None
+              continue
+          hostname = parsed.hostname.lower()
+          endpoint_summary[field] = value
+          if hostname not in allowed_hosts:
+              add("ENDPOINT_HOST_NOT_ALLOWLISTED", "BLOCK", f"Endpoint {field} uses host '{hostname}' not present in allowed_endpoint_hosts.")
+
+      jwks = {}
+      jwks_headers = {}
+      jwks_uri = str(discovery.get("jwks_uri") or "")
+      jwks_host = urllib.parse.urlparse(jwks_uri).hostname
+      if jwks_host and jwks_host.lower() in allowed_hosts:
+          jwks, jwks_headers = fetch_json(jwks_uri, jwks_host)
+      keys = jwks.get("keys") if isinstance(jwks, dict) else None
+      if not isinstance(keys, list):
+          keys = []
+          add("JWKS_KEYS_INVALID", "BLOCK", "JWKS response does not contain a keys array.")
+      if len(keys) < minimum_key_count:
+          add("JWKS_KEY_COUNT_TOO_LOW", "BLOCK", f"JWKS contains {len(keys)} public keys; minimum is {minimum_key_count}.")
+
+      kids = []
+      algorithms = set()
+      key_types = []
+      private_material_fields = {"d", "p", "q", "dp", "dq", "qi", "oth"}
+      weak_rsa_kids = []
+      invalid_entries = []
+      for index, key in enumerate(keys):
+          if not isinstance(key, dict):
+              invalid_entries.append(str(index))
+              continue
+          kid = str(key.get("kid") or "").strip()
+          if kid:
+              kids.append(kid)
+          kty = str(key.get("kty") or "").upper()
+          key_types.append(kty or "UNKNOWN")
+          alg = str(key.get("alg") or "").upper()
+          if alg:
+              algorithms.add(alg)
+              if alg not in allowed_algorithms:
+                  add("SIGNING_ALGORITHM_NOT_ALLOWLISTED", "BLOCK", f"Key {kid or index} advertises algorithm {alg} outside the configured allowlist.")
+          if key.get("use") not in (None, "sig"):
+              add("JWK_USE_NOT_SIGNATURE", "WARN", f"Key {kid or index} has use={key.get('use')}; it may not be an ID-token signing key.")
+          private_fields = sorted(private_material_fields.intersection(key.keys()))
+          if private_fields:
+              add("PRIVATE_JWK_MATERIAL_EXPOSED", "BLOCK", f"Public JWKS entry {kid or index} contains private key field(s): {', '.join(private_fields)}.")
+          if kty == "RSA":
+              modulus = str(key.get("n") or "")
+              try:
+                  pad = "=" * ((4 - len(modulus) % 4) % 4)
+                  bit_length = int.from_bytes(base64.urlsafe_b64decode(modulus + pad), "big").bit_length()
+                  if bit_length < 2048:
+                      weak_rsa_kids.append(kid or str(index))
+              except Exception:
+                  add("RSA_MODULUS_INVALID", "BLOCK", f"RSA key {kid or index} has an invalid modulus encoding.")
+          elif kty not in {"EC", "OKP"}:
+              add("JWK_KEY_TYPE_UNSUPPORTED", "WARN", f"Key {kid or index} has an unrecognized public key type {kty or 'missing'}.")
+
+      if invalid_entries:
+          add("JWKS_ENTRY_INVALID", "BLOCK", "Non-object JWKS entries found at indexes: " + ", ".join(invalid_entries))
+      duplicates = sorted({kid for kid in kids if kids.count(kid) > 1})
+      if require_unique_kids and duplicates:
+          add("JWKS_KID_DUPLICATED", "BLOCK", "JWKS contains duplicate kid values: " + ", ".join(duplicates))
+      if weak_rsa_kids:
+          add("RSA_KEY_TOO_SMALL", "BLOCK", "RSA key(s) are smaller than 2048 bits: " + ", ".join(weak_rsa_kids))
+
+      blocking = [item for item in findings if item["severity"] == "BLOCK"]
+      warnings = [item for item in findings if item["severity"] == "WARN"]
+      verdict = "FAIL" if blocking else ("PASS_WITH_WARNINGS" if warnings else "PASS")
+      report = {
+          "schemaVersion": 1,
+          "checkedAt": datetime.now(timezone.utc).isoformat(),
+          "expectedIssuer": issuer_url,
+          "discoveryUrl": discovery_url,
+          "discoveryHttpCacheControl": discovery_headers.get("Cache-Control", ""),
+          "discoveredIssuer": discovered_issuer,
+          "endpointSummary": endpoint_summary,
+          "allowedEndpointHosts": sorted(allowed_hosts),
+          "allowedSigningAlgorithms": sorted(allowed_algorithms),
+          "jwksUri": jwks_uri,
+          "jwksHttpCacheControl": jwks_headers.get("Cache-Control", ""),
+          "jwksKeyCount": len(keys),
+          "keyIds": kids,
+          "keyTypes": sorted(set(key_types)),
+          "observedAlgorithms": sorted(algorithms),
+          "duplicateKeyIds": duplicates,
+          "weakRsaKeyIds": weak_rsa_kids,
+          "findings": findings,
+          "blockingFindingCount": len(blocking),
+          "warningCount": len(warnings),
+          "verdict": verdict,
+          "scopeNote": "This checks public discovery metadata and JWKS structure. It does not authenticate a user, request tokens, validate an ID token, or prove the provider's private signing keys are uncompromised.",
+      }
+      with open("oidc-provider-audit.json", "w", encoding="utf-8") as target:
+          json.dump(report, target, indent=2, ensure_ascii=False)
+
+      print(f"OIDC discovery/JWKS audit: {issuer_url} verdict={verdict}; keys={len(keys)}, key types={sorted(set(key_types))}, algorithms={sorted(algorithms)}, blocking={len(blocking)}, warnings={len(warnings)}")
+      Kestra.outputs({
+          "issuer_url": issuer_url,
+          "discovered_issuer": discovered_issuer,
+          "jwks_uri": jwks_uri,
+          "jwks_key_count": len(keys),
+          "key_ids": kids,
+          "key_types": sorted(set(key_types)),
+          "observed_algorithms": sorted(algorithms),
+          "blocking_finding_count": len(blocking),
+          "warning_count": len(warnings),
+          "verdict": verdict,
+          "findings": findings,
+      })
+
+  - id: optionally_archive_report
+    type: io.kestra.plugin.core.flow.If
+    description: Optionally archive the OIDC metadata report in S3 under an execution-specific key.
+    condition: "{{ inputs.archive_report }}"
+    then:
+      - id: upload_oidc_provider_report
+        type: io.kestra.plugin.aws.s3.Upload
+        description: Store OIDC endpoint and public JWKS evidence without authentication tokens.
+        accessKeyId: "{{ secret('AWS_ACCESS_KEY_ID') }}"
+        secretKeyId: "{{ secret('AWS_SECRET_ACCESS_KEY') }}"
+        region: "{{ inputs.aws_region }}"
+        bucket: "{{ inputs.evidence_bucket }}"
+        from: "{{ outputs.audit_oidc_discovery_and_jwks.outputFiles['oidc-provider-audit.json'] }}"
+        key: "{{ inputs.evidence_prefix }}/{{ execution.id }}/oidc-provider-audit.json"
+
+  - id: enforce_oidc_provider_policy
+    type: io.kestra.plugin.core.flow.If
+    description: Fail closed when issuer identity, endpoint host allowlists, JWKS key structure, or signing algorithm policy fails.
+    condition: "{{ outputs.audit_oidc_discovery_and_jwks.vars.verdict == 'FAIL' }}"
+    then:
+      - id: alert_oidc_provider_failure
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        description: Notify the identity or security team about provider metadata drift and JWKS issues.
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        payload: |-
+          {{
+            {
+              "text": ":rotating_light: OIDC discovery/JWKS policy failed\\nIssuer: " ~ outputs.audit_oidc_discovery_and_jwks.vars.issuer_url ~
+                "\\nDiscovered issuer: " ~ outputs.audit_oidc_discovery_and_jwks.vars.discovered_issuer ~
+                "\\nJWKS URI: " ~ outputs.audit_oidc_discovery_and_jwks.vars.jwks_uri ~
+                "\\nFindings: " ~ (outputs.audit_oidc_discovery_and_jwks.vars.findings | toJson) ~
+                "\\nExecution: " ~ execution.id ~
+                "\\nReview oidc-provider-audit.json before trusting this identity provider."
+            } | toJson
+          }}
+      - id: fail_oidc_provider_gate
+        type: io.kestra.plugin.core.execution.Fail
+        description: Stop downstream identity-provider onboarding or changes when the configured OIDC posture fails.
+        errorMessage: "OIDC discovery/JWKS policy failed for {{ outputs.audit_oidc_discovery_and_jwks.vars.issuer_url }}. Review oidc-provider-audit.json."
+    else:
+      - id: log_oidc_provider_verdict
+        type: io.kestra.plugin.core.log.Log
+        level: INFO
+        message: "OIDC discovery/JWKS policy {{ outputs.audit_oidc_discovery_and_jwks.vars.verdict }} for {{ outputs.audit_oidc_discovery_and_jwks.vars.issuer_url }}; keys={{ outputs.audit_oidc_discovery_and_jwks.vars.jwks_key_count }}."
+
+errors:
+  - id: alert_oidc_provider_execution_failure
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    description: Alert when DNS, discovery, JWKS access, parsing or orchestration fails.
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    payload: |-
+      {{
+        {
+          "text": ":warning: OIDC provider audit execution failed\\nIssuer: " ~ inputs.issuer_url ~
+            "\\nExecution: " ~ execution.id ~
+            "\\nInspect task logs; do not trust this provider based on a failed audit."
+        } | toJson
+      }}
+
+extend:
+  title: OIDC Discovery and JWKS Integrity Gate
+  metaTitle: OIDC Discovery and JWKS Integrity Gate | Kestra
+  shortDescription: Validate OIDC issuer metadata, required HTTPS endpoints, allowed hosts and public JWKS structure before identity-provider onboarding.
+  metaDescription: Check OIDC issuer consistency, HTTPS discovery endpoints, JWKS key count, unique identifiers, key strength and allowed signing algorithms.
+  description: |
+    Audit an OpenID Connect provider before onboarding it or modifying identity infrastructure. The workflow retrieves the public discovery document and JSON Web Key Set from configured hosts, verifies issuer consistency, checks required HTTPS endpoints, and inspects JWK identifiers, algorithms, key types, and exposed private fields. It writes JSON evidence and can route policy failures to Slack and a failing task.
+
+    ## How it works
+
+    1. The validation task checks the issuer URL and the endpoint hostname and signing algorithm allowlists.
+    2. The audit task fetches the issuer's well-known openid-configuration document over HTTPS.
+    3. It confirms the advertised issuer matches the expected issuer, and required authorization, token and JWKS endpoints are HTTPS on allowlisted hosts.
+    4. It fetches the public JWKS document, verifies a keys array, checks key identifiers, supported algorithms, RSA modulus size and the absence of private JWK fields.
+    5. The JSON report records endpoint metadata, cache headers, key counts and findings. An optional S3 branch archives evidence and the policy If alerts and fails on blocking findings.
+
+    ## What you get
+
+    - A repeatable audit of public OIDC discovery and signing-key metadata.
+    - Fail-closed handling for issuer mismatch, endpoint host violations, private material in JWKS, weak RSA keys and unapproved algorithms.
+    - Evidence of key identifiers, types, signing algorithms and response cache metadata.
+    - Optional Slack alerting and S3 evidence retention.
+
+    ## Who it's for
+
+    - Identity and access-management teams onboarding OIDC providers.
+    - Platform security teams reviewing authentication dependencies.
+    - SRE teams monitoring identity-provider configuration drift.
+
+    ## Why orchestrate this with Kestra
+
+    Kestra makes endpoint and algorithm allowlists explicit, records each discovery run, schedules rechecks and routes findings into a reviewable security report before downstream identity changes.
+
+    ## Prerequisites
+
+    - A Kestra 2.x worker with Docker enabled for Python Script tasks.
+    - Network access to the issuer, advertised OIDC endpoints, JWKS host and public DNS.
+    - An explicit allowlist of trusted public endpoint hostnames.
+    - A Slack incoming webhook for alerts and an S3 bucket only if optional evidence archival is enabled.
+
+    ### Secrets
+
+    - SLACK_WEBHOOK_URL: Slack incoming webhook used for policy failures and execution errors.
+    - AWS_ACCESS_KEY_ID: optional AWS access key used only when S3 archival is enabled.
+    - AWS_SECRET_ACCESS_KEY: optional AWS secret key used only when S3 archival is enabled.
+
+    ## Quick start
+
+    1. Import the flow with issuer_url=https://accounts.google.com and review the allowed endpoint host list.
+    2. Execute manually and inspect oidc-provider-audit.json, especially issuer comparison, endpoint hosts, key IDs and signing algorithms.
+    3. Keep only hosts published by the selected provider in allowed_endpoint_hosts.
+    4. Tune allowed_signing_algorithms and minimum_jwks_key_count to match your application's acceptance policy.
+    5. Configure SLACK_WEBHOOK_URL before relying on alerts, and enable the weekly trigger only after reviewing the first audit.
+
+    ## How to extend
+
+    - Compare provider discovery metadata against an approved snapshot committed to Git.
+    - Alert when JWKS keys rotate, when a previously seen key ID disappears, or when a new algorithm is introduced.
+    - Validate ID tokens from a non-production test client in a separate authenticated test flow.
+    - Send the JSON report to an identity posture dashboard or change-approval workflow.
+
+    ## Links
+
+    - [OpenID Connect Discovery 1.0](https://openid.net/specs/openid-connect-discovery-1_0.html)
+    - [RFC 7517: JSON Web Key (JWK)](https://www.rfc-editor.org/rfc/rfc7517)
+    - [Kestra Python Script plugin](https://kestra.io/plugins/plugin-scripts/python)
+    - [Kestra Slack plugin](https://kestra.io/plugins/plugin-slack/slackincomingwebhook)
+    - [Kestra AWS S3 plugin](https://kestra.io/plugins/plugin-aws/s3)
+  tags:
+    - Infrastructure
+  subTags:
+    - Policy & Compliance
+    - Monitoring & Alerting
+  ee: false
+  demo: false
