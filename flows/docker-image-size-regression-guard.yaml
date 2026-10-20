@@ -55,15 +55,37 @@ inputs:
 
 tasks:
   - id: validate_image_repository
-    type: io.kestra.plugin.core.execution.Assert
-    description: Reject a webhook image from a different repository before Docker calls or baseline access.
-    errorMessage: >-
-      Image reference '{{ trigger.body.image ?? inputs.image }}' does not match
-      configured repository '{{ inputs.repository }}'. Use the same repository
-      with an optional tag or digest.
-    conditions:
-      - "{{ inputs.repository != '' }}"
-      - "{{ (trigger.body.image ?? inputs.image) == inputs.repository or ((trigger.body.image ?? inputs.image) | startsWith(inputs.repository ~ ':')) or ((trigger.body.image ?? inputs.image) | startsWith(inputs.repository ~ '@')) }}"
+    type: io.kestra.plugin.scripts.python.Script
+    description: Reject image references that do not belong to the configured repository before any Docker calls or baseline access.
+    taskRunner:
+      type: io.kestra.plugin.core.runner.Process
+    env:
+      IMAGE_REFERENCE: "{{ trigger.body.image ?? inputs.image }}"
+      EXPECTED_REPOSITORY: "{{ inputs.repository }}"
+    script: |
+      import os
+
+      image_reference = os.environ["IMAGE_REFERENCE"].strip()
+      expected_repository = os.environ["EXPECTED_REPOSITORY"].strip().rstrip("/")
+
+      if not image_reference or not expected_repository:
+          raise SystemExit("Both the image reference and configured repository must be non-empty.")
+
+      # A digest follows '@'. A tag is the final colon-delimited suffix only
+      # when its colon appears after the final slash (preserves registry ports).
+      repository_reference = image_reference.split("@", 1)[0]
+      last_slash = repository_reference.rfind("/")
+      last_colon = repository_reference.rfind(":")
+      if last_colon > last_slash:
+          repository_reference = repository_reference[:last_colon]
+
+      if repository_reference != expected_repository:
+          raise SystemExit(
+              f"Image repository mismatch: got '{repository_reference}', "
+              f"expected '{expected_repository}'."
+          )
+
+      print(f"Validated image repository '{repository_reference}'.")
 
   - id: ensure_image
     type: io.kestra.plugin.core.flow.If
