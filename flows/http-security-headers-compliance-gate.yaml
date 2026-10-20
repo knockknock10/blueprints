@@ -300,7 +300,7 @@ tasks:
         region: "{{ inputs.aws_region }}"
         bucket: "{{ inputs.evidence_bucket }}"
         from: "{{ outputs.audit_security_headers.outputFiles['http-security-headers-audit.json'] }}"
-        key: "{{ inputs.evidence_prefix }}/{{ inputs.target_url | replace('https://', '') | replace('/', '_') }}/http-security-headers-audit.json"
+        key: "{{ inputs.evidence_prefix }}/{{ execution.id }}/http-security-headers-audit.json"
 
   - id: enforce_header_policy
     type: io.kestra.plugin.core.flow.If
