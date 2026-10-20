@@ -1,0 +1,404 @@
+id: cname-dangling-target-sentinel
+namespace: company.infrastructure
+description: |
+  Inspect a public hostname's DNS CNAME chain and look for potential dangling targets on common hosted
+  platforms. The flow queries DNS over HTTPS, follows aliases, and checks A/AAAA resolution for the final
+  target. It only flags a potential takeover when a target associated with a known hosting provider is
+  confirmed NXDOMAIN; a CNAME alone is not treated as vulnerable. It produces JSON evidence, can archive
+  the report to S3, and fails the policy when the configured hostname or hosted target is unresolved.
+
+inputs:
+  - id: hostname
+    type: STRING
+    displayName: Hostname to inspect
+    defaults: www.github.com
+    description: Fully qualified hostname without a URL scheme or path.
+  - id: provider_suffixes
+    type: STRING
+    displayName: Hosted platform suffixes
+    defaults: github.io,herokuapp.com,herokudns.com,cloudfront.net,azurewebsites.net,azurefd.net,fastly.net,pantheonsite.io,myshopify.com,surge.sh,readme.io
+    description: Comma-separated known hosted-platform suffixes used to identify potential takeover candidates after confirmed NXDOMAIN.
+  - id: max_cname_hops
+    type: INT
+    displayName: Maximum CNAME hops
+    defaults: 8
+    description: Maximum alias depth to follow before failing closed on a possible loop or unusually long chain.
+  - id: require_hostname_resolution
+    type: BOOL
+    displayName: Require hostname to resolve
+    defaults: true
+    description: Block if the configured hostname itself is NXDOMAIN.
+  - id: archive_report
+    type: BOOL
+    displayName: Archive report to S3
+    defaults: false
+    description: Store the DNS evidence report in S3. AWS secrets are required only when enabled.
+  - id: evidence_bucket
+    type: STRING
+    displayName: Evidence bucket
+    defaults: my-domain-security-evidence
+    description: Existing S3 bucket used when report archival is enabled.
+  - id: evidence_prefix
+    type: STRING
+    displayName: Evidence prefix
+    defaults: cname-dangling-target
+    description: Prefix for per-host CNAME audit reports.
+  - id: aws_region
+    type: STRING
+    displayName: AWS region
+    defaults: eu-west-1
+    description: Region of the evidence bucket.
+
+triggers:
+  - id: weekly_cname_audit
+    type: io.kestra.plugin.core.trigger.Schedule
+    description: Recheck the configured hostname weekly to catch DNS target changes. Enable after reviewing the provider suffix policy.
+    cron: "0 8 * * 1"
+    disabled: true
+
+tasks:
+  - id: validate_hostname
+    type: io.kestra.plugin.scripts.python.Script
+    description: Validate hostname, provider suffixes and CNAME hop limit before performing DNS queries.
+    containerImage: python:3.12-slim
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+    env:
+      HOSTNAME_TO_CHECK: "{{ inputs.hostname }}"
+      PROVIDER_SUFFIXES: "{{ inputs.provider_suffixes }}"
+      MAX_CNAME_HOPS: "{{ inputs.max_cname_hops }}"
+    script: |
+      import os
+      import re
+
+      hostname = os.environ.get("HOSTNAME_TO_CHECK", "").strip().lower().rstrip(".")
+      suffixes = [x.strip().lower().lstrip(".") for x in os.environ.get("PROVIDER_SUFFIXES", "").split(",") if x.strip()]
+      try:
+          max_hops = int(os.environ.get("MAX_CNAME_HOPS", "8"))
+      except ValueError as exc:
+          raise ValueError("max_cname_hops must be an integer") from exc
+      if not re.fullmatch(r"(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}", hostname):
+          raise ValueError("hostname must be a fully qualified ASCII DNS name without a URL scheme or path")
+      if not suffixes:
+          raise ValueError("provider_suffixes must contain at least one suffix")
+      if max_hops < 1 or max_hops > 32:
+          raise ValueError("max_cname_hops must be between 1 and 32")
+      print(f"Validated CNAME chain check for {hostname} with {len(suffixes)} provider suffixes.")
+
+  - id: fetch_initial_cname
+    type: io.kestra.plugin.core.http.Request
+    description: Query Google's public DNS-over-HTTPS resolver for the real CNAME answer of the selected hostname.
+    uri: "https://dns.google/resolve?name={{ inputs.hostname }}&type=CNAME"
+    method: GET
+    headers:
+      Accept: application/dns-json
+      User-Agent: Kestra-CNAME-Dangling-Target-Sentinel/1.0
+    timeout: PT20S
+
+  - id: audit_cname_chain
+    type: io.kestra.plugin.scripts.python.Script
+    description: Follow CNAME aliases using live DNS-over-HTTPS, query A/AAAA records for the terminal target, and distinguish potential hosted-platform takeover cases from ordinary aliasing.
+    containerImage: python:3.12-slim
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+    beforeCommands:
+      - pip install kestra
+    inputFiles:
+      initial-cname.json: "{{ outputs.fetch_initial_cname.body }}"
+    env:
+      HOSTNAME_TO_CHECK: "{{ inputs.hostname }}"
+      PROVIDER_SUFFIXES: "{{ inputs.provider_suffixes }}"
+      MAX_CNAME_HOPS: "{{ inputs.max_cname_hops }}"
+      REQUIRE_HOST_RESOLUTION: "{{ inputs.require_hostname_resolution }}"
+    outputFiles:
+      - cname-dangling-audit.json
+    script: |
+      import json
+      import os
+      import time
+      from datetime import datetime, timezone
+      from urllib.parse import urlencode
+      from urllib.request import Request, urlopen
+
+      from kestra import Kestra
+
+      hostname = os.environ["HOSTNAME_TO_CHECK"].strip().lower().rstrip(".")
+      provider_suffixes = [x.strip().lower().lstrip(".") for x in os.environ.get("PROVIDER_SUFFIXES", "").split(",") if x.strip()]
+      max_hops = int(os.environ.get("MAX_CNAME_HOPS", "8"))
+      require_host_resolution = os.environ.get("REQUIRE_HOST_RESOLUTION", "true").lower() == "true"
+
+      with open("initial-cname.json", encoding="utf-8") as source:
+          initial = json.load(source)
+      if not isinstance(initial, dict) or "Status" not in initial:
+          raise ValueError("DNS-over-HTTPS response for the initial hostname is not a valid DNS JSON object")
+
+      findings = []
+      def add(code, severity, message, name=None):
+          findings.append({"code": code, "severity": severity, "name": name, "message": message})
+
+      def query_dns(name, record_type):
+          params = urlencode({"name": name, "type": record_type})
+          request = Request(
+              "https://dns.google/resolve?" + params,
+              headers={"Accept": "application/dns-json", "User-Agent": "Kestra-CNAME-Dangling-Target-Sentinel/1.0"},
+          )
+          with urlopen(request, timeout=12) as response:
+              return json.load(response)
+
+      def cname_target(response):
+          answers = response.get("Answer") or []
+          for answer in answers:
+              if isinstance(answer, dict) and answer.get("type") == 5 and answer.get("data"):
+                  return str(answer["data"]).strip().lower().rstrip(".")
+          return None
+
+      def is_known_provider(name):
+          return any(name == suffix or name.endswith("." + suffix) for suffix in provider_suffixes)
+
+      current = hostname
+      visited = set()
+      chain = []
+      initial_status = initial.get("Status")
+      if initial_status == 3 and require_host_resolution:
+          add("HOSTNAME_NXDOMAIN", "BLOCK", "Configured hostname returned NXDOMAIN.", hostname)
+
+      response = initial
+      terminal_status = initial_status
+      terminal_target = None
+      loop_detected = False
+      for hop in range(max_hops):
+          target = cname_target(response)
+          if not target:
+              terminal_target = current
+              terminal_status = response.get("Status")
+              break
+          if target in visited or target == current:
+              chain.append({"from": current, "to": target})
+              add("CNAME_LOOP_DETECTED", "BLOCK", "CNAME chain contains a loop.", target)
+              loop_detected = True
+              terminal_target = target
+              terminal_status = response.get("Status")
+              break
+          chain.append({"from": current, "to": target})
+          visited.add(current)
+          current = target
+          try:
+              response = query_dns(current, "CNAME")
+          except Exception as exc:
+              add("DNS_QUERY_ERROR", "WARN", f"DNS query failed for CNAME target {current!r}: {exc}", current)
+              terminal_target = current
+              terminal_status = None
+              break
+          terminal_status = response.get("Status")
+          if terminal_status == 3:
+              terminal_target = current
+              break
+          if hop == max_hops - 1 and cname_target(response):
+              add("CNAME_HOP_LIMIT_REACHED", "BLOCK", f"CNAME chain exceeded the configured limit of {max_hops} hops.", current)
+              terminal_target = current
+              loop_detected = True
+
+      terminal_exists = False
+      terminal_nxdomain = terminal_status == 3
+      terminal_answers = []
+      if terminal_target and not loop_detected and not terminal_nxdomain:
+          for record_type in ("A", "AAAA"):
+              try:
+                  answer = query_dns(terminal_target, record_type)
+                  if answer.get("Status") == 0 and (answer.get("Answer") or []):
+                      terminal_exists = True
+                      terminal_answers.extend([
+                          {"type": record_type, "data": row.get("data")}
+                          for row in answer.get("Answer", [])
+                          if isinstance(row, dict) and row.get("data")
+                      ])
+                  elif answer.get("Status") == 3:
+                      terminal_nxdomain = True
+              except Exception as exc:
+                  add("DNS_QUERY_ERROR", "WARN", f"DNS query failed for {record_type} on {terminal_target!r}: {exc}", terminal_target)
+
+      potential_takeover = bool(chain) and terminal_nxdomain and is_known_provider(terminal_target or "")
+      if potential_takeover:
+          add("POTENTIAL_DANGLING_HOSTED_TARGET", "BLOCK", f"CNAME chain ends at known hosted-platform suffix with NXDOMAIN target {terminal_target!r}; verify whether the underlying hosted resource can be claimed.", terminal_target)
+      elif terminal_nxdomain and chain:
+          add("CNAME_TARGET_NXDOMAIN", "BLOCK", f"CNAME chain ends at NXDOMAIN target {terminal_target!r}.", terminal_target)
+      elif not chain and initial_status == 0:
+          add("NO_CNAME_PRESENT", "INFO", "The configured hostname did not return a CNAME record; no CNAME takeover candidate was evaluated.", hostname)
+
+      verdict = "FAIL" if any(f["severity"] == "BLOCK" for f in findings) else ("PASS_WITH_WARNINGS" if any(f["severity"] == "WARN" for f in findings) else "PASS")
+      report = {
+          "schemaVersion": 1,
+          "checkedAt": datetime.now(timezone.utc).isoformat(),
+          "hostname": hostname,
+          "initialDnsStatus": initial_status,
+          "cnameChain": chain,
+          "cnameHopCount": len(chain),
+          "terminalTarget": terminal_target,
+          "terminalDnsStatus": terminal_status,
+          "terminalTargetExists": terminal_exists,
+          "terminalTargetAddresses": terminal_answers,
+          "matchedHostedProviderSuffix": is_known_provider(terminal_target or ""),
+          "potentialTakeover": potential_takeover,
+          "providerSuffixes": provider_suffixes,
+          "findings": findings,
+          "blockingFindingCount": sum(1 for f in findings if f["severity"] == "BLOCK"),
+          "warningCount": sum(1 for f in findings if f["severity"] == "WARN"),
+          "verdict": verdict,
+          "scopeNote": "A potential dangling CNAME result is a risk signal, not proof that a provider resource is claimable. Confirm provider-specific ownership and registration before remediation.",
+      }
+      with open("cname-dangling-audit.json", "w", encoding="utf-8") as target:
+          json.dump(report, target, indent=2, ensure_ascii=False)
+      print(f"CNAME dangling-target audit: {hostname} verdict={verdict}; hops={len(chain)}, terminal={terminal_target}, potential_takeover={potential_takeover}")
+      Kestra.outputs({
+          "hostname": hostname,
+          "cname_chain": chain,
+          "cname_hop_count": len(chain),
+          "terminal_target": terminal_target or "",
+          "terminal_dns_status": terminal_status,
+          "terminal_target_exists": terminal_exists,
+          "potential_takeover": potential_takeover,
+          "blocking_finding_count": report["blockingFindingCount"],
+          "warning_count": report["warningCount"],
+          "findings": findings,
+          "verdict": verdict,
+      })
+
+  - id: optionally_archive_report
+    type: io.kestra.plugin.core.flow.If
+    description: Optionally archive the CNAME evidence report in S3 for incident review.
+    condition: "{{ inputs.archive_report }}"
+    then:
+      - id: upload_cname_report
+        type: io.kestra.plugin.aws.s3.Upload
+        description: Store the chain and target-resolution evidence without changing DNS.
+        accessKeyId: "{{ secret('AWS_ACCESS_KEY_ID') }}"
+        secretKeyId: "{{ secret('AWS_SECRET_ACCESS_KEY') }}"
+        region: "{{ inputs.aws_region }}"
+        bucket: "{{ inputs.evidence_bucket }}"
+        from: "{{ outputs.audit_cname_chain.outputFiles['cname-dangling-audit.json'] }}"
+        key: "{{ inputs.evidence_prefix }}/{{ inputs.hostname | replace('.', '_') }}/cname-dangling-audit.json"
+
+  - id: enforce_cname_policy
+    type: io.kestra.plugin.core.flow.If
+    description: Fail closed when the configured hostname is missing, a CNAME target is dangling, or a potential hosted-platform takeover is found.
+    condition: "{{ outputs.audit_cname_chain.vars.verdict == 'FAIL' }}"
+    then:
+      - id: alert_dangling_cname
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        description: Alert the domain owner with the chain and target that needs investigation.
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        payload: |-
+          {{
+            {
+              "text": ":rotating_light: CNAME dangling-target gate BLOCKED\\nHostname: " ~ outputs.audit_cname_chain.vars.hostname ~
+                "\\nChain: " ~ (outputs.audit_cname_chain.vars.cname_chain | toJson) ~
+                "\\nPotential takeover: " ~ outputs.audit_cname_chain.vars.potential_takeover ~
+                "\\nFindings: " ~ (outputs.audit_cname_chain.vars.findings | toJson) ~
+                "\\nExecution: " ~ execution.id
+            } | toJson
+          }}
+      - id: fail_cname_policy
+        type: io.kestra.plugin.core.execution.Fail
+        description: Stop downstream publication when dangling CNAME policy checks fail.
+        errorMessage: "CNAME dangling-target policy failed for {{ outputs.audit_cname_chain.vars.hostname }}."
+    else:
+      - id: log_cname_verdict
+        type: io.kestra.plugin.core.log.Log
+        level: INFO
+        message: "CNAME audit {{ outputs.audit_cname_chain.vars.verdict }} for {{ outputs.audit_cname_chain.vars.hostname }}; hops={{ outputs.audit_cname_chain.vars.cname_hop_count }}, potential takeover={{ outputs.audit_cname_chain.vars.potential_takeover }}."
+
+errors:
+  - id: alert_dns_query_failure
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    description: Alert when DNS queries or parsing fail so an incomplete resolver check is not treated as passing.
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    payload: |-
+      {{
+        {
+          "text": ":warning: CNAME dangling-target audit execution failed\\nHostname: " ~ inputs.hostname ~
+            "\\nExecution: " ~ execution.id ~
+            "\\nInspect Kestra logs; resolver failures must not be interpreted as PASS."
+        } | toJson
+      }}
+
+outputs:
+  - id: cname_audit
+    type: JSON
+    description: Machine-readable CNAME chain, terminal target resolution, hosted-provider match and policy verdict.
+    value: "{{ outputs.audit_cname_chain.vars | toJson }}"
+
+extend:
+  title: CNAME Dangling Target and Takeover Risk Sentinel
+  metaTitle: CNAME Dangling Target and Takeover Risk Sentinel | Kestra
+  shortDescription: Follow live CNAME chains and flag potential hosted-platform takeover risks only when a known provider target is confirmed NXDOMAIN.
+  metaDescription: Detect DNS CNAME chains ending at unresolved hosted-platform targets, with full chain evidence and scheduled rechecks for domain security.
+  description: |
+    Inspect a hostname's live DNS CNAME chain and identify potential dangling targets on common hosted platforms. The workflow queries DNS over HTTPS, follows aliases, checks terminal A/AAAA resolution, and flags a potential takeover only when a known provider suffix is paired with confirmed NXDOMAIN. It emits a JSON report, supports S3 evidence retention, and alerts when the configured hostname or target chain violates policy.
+
+    ## How it works
+
+    1. Validate the hostname, provider suffix policy and maximum alias depth.
+    2. Query the public DNS-over-HTTPS endpoint for the configured hostname's CNAME record.
+    3. Follow aliases and query terminal CNAME, A and AAAA records to determine whether the target resolves.
+    4. Compare an unresolved terminal target against the configured hosted-platform suffix list and record evidence.
+    5. Optionally archive the report to S3 and fail when a hostname is missing or a potential dangling target is found.
+
+    ## What you get
+
+    - A machine-readable chain of CNAME aliases and terminal target resolution evidence.
+    - Detection of hostname NXDOMAIN, CNAME loops, hop-limit overruns and resolver errors.
+    - Identification of potential takeover candidates only when a known hosted-platform suffix and NXDOMAIN are both observed.
+    - Optional S3 evidence retention and a blocking alert path.
+
+    ## Who it's for
+
+    - Security engineers maintaining public DNS records.
+    - Platform teams using hosted documentation, static sites and cloud front ends.
+    - Domain owners performing recurring DNS hygiene checks.
+
+    ## Why orchestrate this with Kestra
+
+    Kestra records the DNS observations, allows a recurring check, stores evidence for incident review and routes confirmed policy findings into an explicit blocking state.
+
+    ## Prerequisites
+
+    - A Kestra 2.x worker with Docker enabled for the Python Script task runner.
+    - Egress access to dns.google over HTTPS.
+    - A Slack incoming webhook for alerts; S3 archival is optional.
+
+    ### Secrets
+
+    - SLACK_WEBHOOK_URL: Slack incoming webhook for blocking findings and resolver failures.
+    - AWS_ACCESS_KEY_ID: optional AWS access key used only when report archival is enabled.
+    - AWS_SECRET_ACCESS_KEY: optional AWS secret key used only when report archival is enabled.
+
+    ## Quick start
+
+    1. Import the flow with hostname www.github.com and execute manually.
+    2. Review cname-dangling-audit.json and the cname_audit output.
+    3. Expand provider_suffixes only for the cloud and hosting platforms your organization uses.
+    4. Set max_cname_hops according to your environment and confirm the hostname itself resolves.
+    5. Configure Slack and optional S3, then enable weekly_cname_audit after reviewing the first report.
+
+    ## How to extend
+
+    - Add provider-specific signals for resources known to become claimable after DNS deletion.
+    - Accept a list of hostnames and process each with a ForEach task.
+    - Compare checked hosts to an approved inventory sourced from Git or a service catalogue.
+    - Add an investigation ticket that includes chain evidence and service ownership metadata.
+
+    ## Links
+
+    - [Google Public DNS-over-HTTPS API](https://developers.google.com/speed/public-dns/docs/doh/json)
+    - [OWASP subdomain takeover guidance](https://owasp.org/www-community/attacks/Subdomain_takeover)
+    - [Kestra HTTP Request plugin](https://kestra.io/plugins/plugin-core/http/io.kestra.plugin.core.http.request)
+    - [Kestra Python Script plugin](https://kestra.io/plugins/plugin-scripts/python)
+    - [Kestra Slack plugin](https://kestra.io/plugins/plugin-slack/slackincomingwebhook)
+    - [Kestra AWS S3 plugin](https://kestra.io/plugins/plugin-aws/s3)
+  tags:
+    - Infrastructure
+  subTags:
+    - Monitoring & Alerting
+    - Policy & Compliance
+  ee: false
+  demo: false
