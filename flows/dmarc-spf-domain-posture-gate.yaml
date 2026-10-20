@@ -1,0 +1,390 @@
+id: dmarc-spf-domain-posture-gate
+namespace: company.security
+description: |
+  Audit a domain's published DMARC policy, SPF record and MX presence before onboarding or a security review.
+  The flow checks the DMARC enforcement level, reporting configuration, rollout percentage, and whether
+  exactly one SPF policy is published. It writes a JSON report and can alert Slack and archive evidence.
+
+inputs:
+  - id: domain
+    type: STRING
+    displayName: Email domain
+    defaults: gmail.com
+    description: DNS domain to audit without a URL scheme or path.
+  - id: required_dmarc_policy
+    type: STRING
+    displayName: Minimum DMARC policy
+    defaults: reject
+    description: Minimum accepted p policy. Use quarantine or reject for enforcement.
+  - id: minimum_pct
+    type: INT
+    displayName: Minimum DMARC rollout percentage
+    defaults: 100
+    description: Block when the DMARC pct value is below this value.
+  - id: require_aggregate_reporting
+    type: BOOL
+    displayName: Require aggregate reports
+    defaults: true
+    description: Require at least one rua destination.
+  - id: require_spf
+    type: BOOL
+    displayName: Require SPF policy
+    defaults: true
+    description: Require exactly one TXT record beginning with v=spf1.
+  - id: require_mx
+    type: BOOL
+    displayName: Require MX records
+    defaults: true
+    description: Require at least one DNS MX record.
+  - id: archive_report
+    type: BOOL
+    displayName: Archive report to S3
+    defaults: false
+    description: Store the JSON audit report in S3.
+  - id: evidence_bucket
+    type: STRING
+    displayName: S3 evidence bucket
+    defaults: my-email-policy-evidence
+    description: Existing S3 bucket for optional report retention.
+  - id: evidence_prefix
+    type: STRING
+    displayName: S3 evidence prefix
+    defaults: email-domain-policy-audits
+    description: Object key prefix for email domain posture reports.
+  - id: aws_region
+    type: STRING
+    displayName: AWS region
+    defaults: eu-west-1
+    description: Region containing the evidence bucket.
+
+triggers:
+  - id: weekly_domain_posture_audit
+    type: io.kestra.plugin.core.trigger.Schedule
+    description: Recheck DMARC, SPF and MX policy weekly. Enable after reviewing the enforcement requirements.
+    cron: "0 7 * * 1"
+    disabled: true
+
+tasks:
+  - id: validate_email_domain
+    type: io.kestra.plugin.scripts.python.Script
+    description: Validate the domain and policy thresholds before querying public DNS.
+    containerImage: python:3.12-slim
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+    env:
+      DOMAIN: "{{ inputs.domain }}"
+      REQUIRED_DMARC_POLICY: "{{ inputs.required_dmarc_policy }}"
+      MINIMUM_PCT: "{{ inputs.minimum_pct }}"
+    script: |
+      import os
+      import re
+
+      domain = os.environ.get("DOMAIN", "").strip().lower().rstrip(".")
+      if not re.fullmatch(r"(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}", domain):
+          raise ValueError("domain must be a DNS name without a URL scheme, path or port")
+      policy = os.environ.get("REQUIRED_DMARC_POLICY", "").strip().lower()
+      if policy not in {"quarantine", "reject"}:
+          raise ValueError("required_dmarc_policy must be quarantine or reject")
+      pct = int(os.environ.get("MINIMUM_PCT", "100"))
+      if pct < 0 or pct > 100:
+          raise ValueError("minimum_pct must be between 0 and 100")
+
+      print(f"Validated email domain posture target {domain}; policy={policy}, minimum pct={pct}.")
+
+  - id: audit_dmarc_spf_mx
+    type: io.kestra.plugin.scripts.python.Script
+    description: Query real TXT and MX DNS records, parse DMARC tags, and evaluate enforcement and reporting requirements.
+    containerImage: python:3.12-slim
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+    dependencies:
+      - dnspython
+      - kestra
+    env:
+      DOMAIN: "{{ inputs.domain }}"
+      REQUIRED_DMARC_POLICY: "{{ inputs.required_dmarc_policy }}"
+      MINIMUM_PCT: "{{ inputs.minimum_pct }}"
+      REQUIRE_AGGREGATE_REPORTING: "{{ inputs.require_aggregate_reporting }}"
+      REQUIRE_SPF: "{{ inputs.require_spf }}"
+      REQUIRE_MX: "{{ inputs.require_mx }}"
+    outputFiles:
+      - dmarc-spf-domain-audit.json
+    script: |
+      import json
+      import os
+      from datetime import datetime, timezone
+
+      import dns.exception
+      import dns.resolver
+      from kestra import Kestra
+
+      domain = os.environ["DOMAIN"].strip().lower().rstrip(".")
+      required_policy = os.environ.get("REQUIRED_DMARC_POLICY", "reject").lower()
+      minimum_pct = int(os.environ.get("MINIMUM_PCT", "100"))
+      require_rua = os.environ.get("REQUIRE_AGGREGATE_REPORTING", "true").lower() == "true"
+      require_spf = os.environ.get("REQUIRE_SPF", "true").lower() == "true"
+      require_mx = os.environ.get("REQUIRE_MX", "true").lower() == "true"
+
+      resolver = dns.resolver.Resolver()
+      resolver.timeout = 3
+      resolver.lifetime = 8
+
+      def lookup(name, record_type):
+          try:
+              answer = resolver.resolve(name, record_type, raise_on_no_answer=False)
+              if not answer.rrset:
+                  return []
+              return list(answer)
+          except (dns.resolver.NXDOMAIN, dns.resolver.NoAnswer):
+              return []
+          except (dns.resolver.NoNameservers, dns.exception.Timeout) as exc:
+              raise RuntimeError(f"DNS lookup failed for {name} {record_type}: {type(exc).__name__}") from exc
+
+      dmarc_txt = []
+      for record in lookup(f"_dmarc.{domain}", "TXT"):
+          text = b"".join(record.strings).decode("utf-8", errors="replace").strip()
+          if text.lower().startswith("v=dmarc1"):
+              dmarc_txt.append(text)
+
+      root_txt = [
+          b"".join(record.strings).decode("utf-8", errors="replace").strip()
+          for record in lookup(domain, "TXT")
+      ]
+      spf_records = [text for text in root_txt if text.lower().startswith("v=spf1")]
+      mx_records = sorted(
+          [{"preference": int(record.preference), "exchange": str(record.exchange).rstrip(".")}
+           for record in lookup(domain, "MX")],
+          key=lambda item: (item["preference"], item["exchange"]),
+      )
+
+      findings = []
+      def add(code, severity, message):
+          findings.append({"code": code, "severity": severity, "message": message})
+
+      tags = {}
+      selected_dmarc = dmarc_txt[0] if len(dmarc_txt) == 1 else ""
+      if not dmarc_txt:
+          add("DMARC_RECORD_MISSING", "BLOCK", f"No v=DMARC1 TXT record was found at _dmarc.{domain}.")
+      elif len(dmarc_txt) > 1:
+          add("DMARC_MULTIPLE_RECORDS", "BLOCK", f"Found {len(dmarc_txt)} DMARC records; publish exactly one.")
+
+      if selected_dmarc:
+          for part in selected_dmarc.split(";"):
+              part = part.strip()
+              if not part:
+                  continue
+              if "=" not in part:
+                  add("DMARC_TAG_MALFORMED", "WARN", f"DMARC tag does not contain '=': {part}")
+                  continue
+              key, value = part.split("=", 1)
+              key, value = key.strip().lower(), value.strip()
+              if key in tags:
+                  add("DMARC_DUPLICATE_TAG", "BLOCK", f"DMARC record repeats tag {key}.")
+              tags[key] = value
+
+          policy = tags.get("p", "").lower()
+          ranks = {"none": 0, "quarantine": 1, "reject": 2}
+          if policy not in ranks:
+              add("DMARC_POLICY_INVALID", "BLOCK", "DMARC p tag is missing or not none, quarantine, or reject.")
+          elif ranks[policy] < ranks[required_policy]:
+              add("DMARC_POLICY_TOO_WEAK", "BLOCK", f"DMARC p={policy} is weaker than required p={required_policy}.")
+
+          try:
+              pct = int(tags.get("pct", "100"))
+              if pct < 0 or pct > 100:
+                  raise ValueError
+              if pct < minimum_pct:
+                  add("DMARC_ROLLOUT_TOO_LOW", "BLOCK", f"DMARC pct={pct} is below minimum {minimum_pct}.")
+          except ValueError:
+              pct = None
+              add("DMARC_PCT_INVALID", "BLOCK", "DMARC pct must be an integer from 0 to 100.")
+
+          rua = [item.strip() for item in tags.get("rua", "").split(",") if item.strip()]
+          if require_rua and not rua:
+              add("DMARC_RUA_MISSING", "BLOCK", "DMARC aggregate reporting is required but rua is not configured.")
+      else:
+          policy = ""
+          pct = None
+          rua = []
+
+      if require_spf and len(spf_records) != 1:
+          add("SPF_RECORD_COUNT_INVALID", "BLOCK", f"Expected exactly one SPF record; found {len(spf_records)}.")
+      elif len(spf_records) > 1:
+          add("SPF_MULTIPLE_RECORDS", "BLOCK", "Multiple SPF TXT records can cause a permanent SPF error.")
+      if require_mx and not mx_records:
+          add("MX_RECORDS_MISSING", "BLOCK", "No MX records were found for the domain.")
+
+      blocking = [item for item in findings if item["severity"] == "BLOCK"]
+      warnings = [item for item in findings if item["severity"] == "WARN"]
+      verdict = "FAIL" if blocking else ("PASS_WITH_WARNINGS" if warnings else "PASS")
+      report = {
+          "schemaVersion": 1,
+          "checkedAt": datetime.now(timezone.utc).isoformat(),
+          "domain": domain,
+          "dmarcRecord": selected_dmarc or None,
+          "dmarcPolicy": policy or None,
+          "dmarcPct": pct,
+          "rua": rua,
+          "spfRecordCount": len(spf_records),
+          "spfRecords": spf_records,
+          "mxRecords": mx_records,
+          "requiredPolicy": required_policy,
+          "minimumPct": minimum_pct,
+          "requireAggregateReporting": require_rua,
+          "findings": findings,
+          "blockingFindingCount": len(blocking),
+          "warningCount": len(warnings),
+          "verdict": verdict,
+          "scopeNote": "This checks published DNS records and selected DMARC tags. It does not validate SPF's recursive include count, DKIM selector coverage, alignment for actual mail streams, or real-world report delivery.",
+      }
+      with open("dmarc-spf-domain-audit.json", "w", encoding="utf-8") as target:
+          json.dump(report, target, indent=2, ensure_ascii=False)
+
+      print(f"DMARC/SPF domain audit: {domain} verdict={verdict}; policy={policy or 'missing'}, pct={pct}, SPF records={len(spf_records)}, MX records={len(mx_records)}, blocking={len(blocking)}, warnings={len(warnings)}")
+      Kestra.outputs({
+          "domain": domain,
+          "dmarc_policy": policy,
+          "dmarc_pct": pct if pct is not None else -1,
+          "rua_count": len(rua),
+          "spf_record_count": len(spf_records),
+          "mx_record_count": len(mx_records),
+          "blocking_finding_count": len(blocking),
+          "warning_count": len(warnings),
+          "verdict": verdict,
+          "findings": findings,
+      })
+
+  - id: optionally_archive_report
+    type: io.kestra.plugin.core.flow.If
+    description: Optionally archive the DMARC/SPF/MX posture report in S3.
+    condition: "{{ inputs.archive_report }}"
+    then:
+      - id: upload_email_policy_report
+        type: io.kestra.plugin.aws.s3.Upload
+        description: Store the DNS policy audit evidence using an execution-specific key.
+        accessKeyId: "{{ secret('AWS_ACCESS_KEY_ID') }}"
+        secretKeyId: "{{ secret('AWS_SECRET_ACCESS_KEY') }}"
+        region: "{{ inputs.aws_region }}"
+        bucket: "{{ inputs.evidence_bucket }}"
+        from: "{{ outputs.audit_dmarc_spf_mx.outputFiles['dmarc-spf-domain-audit.json'] }}"
+        key: "{{ inputs.evidence_prefix }}/{{ execution.id }}/dmarc-spf-domain-audit.json"
+
+  - id: enforce_email_domain_policy
+    type: io.kestra.plugin.core.flow.If
+    description: Fail when DMARC enforcement is too weak, reporting is missing, SPF is duplicated or required MX records are absent.
+    condition: "{{ outputs.audit_dmarc_spf_mx.vars.verdict == 'FAIL' }}"
+    then:
+      - id: alert_email_policy_failure
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        description: Notify the domain security owner with policy findings and the DNS evidence report.
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        payload: |-
+          {{
+            {
+              "text": ":rotating_light: Email domain policy failed\\nDomain: " ~ outputs.audit_dmarc_spf_mx.vars.domain ~
+                "\\nDMARC policy: " ~ outputs.audit_dmarc_spf_mx.vars.dmarc_policy ~
+                "\\nFindings: " ~ (outputs.audit_dmarc_spf_mx.vars.findings | toJson) ~
+                "\\nExecution: " ~ execution.id ~
+                "\\nReview dmarc-spf-domain-audit.json."
+            } | toJson
+          }}
+      - id: fail_email_policy_gate
+        type: io.kestra.plugin.core.execution.Fail
+        description: Stop downstream changes when the DNS email-domain posture violates configured requirements.
+        errorMessage: "DMARC/SPF/MX policy failed for {{ outputs.audit_dmarc_spf_mx.vars.domain }}. Review dmarc-spf-domain-audit.json."
+    else:
+      - id: log_email_policy_verdict
+        type: io.kestra.plugin.core.log.Log
+        level: INFO
+        message: "DMARC/SPF domain policy {{ outputs.audit_dmarc_spf_mx.vars.verdict }} for {{ outputs.audit_dmarc_spf_mx.vars.domain }}; DMARC={{ outputs.audit_dmarc_spf_mx.vars.dmarc_policy }}, SPF={{ outputs.audit_dmarc_spf_mx.vars.spf_record_count }}, MX={{ outputs.audit_dmarc_spf_mx.vars.mx_record_count }}."
+
+errors:
+  - id: alert_email_policy_execution_failure
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    description: Alert when DNS resolution, parsing or orchestration fails. Technical failure must not be interpreted as a passing email policy.
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    payload: |-
+      {{
+        {
+          "text": ":warning: DMARC/SPF domain audit execution failed\\nDomain: " ~ inputs.domain ~
+            "\\nExecution: " ~ execution.id ~
+            "\\nInspect task logs; do not assume the email domain policy passed."
+        } | toJson
+      }}
+
+extend:
+  title: DMARC and SPF Email Domain Posture Gate
+  metaTitle: DMARC and SPF Email Domain Posture Gate | Kestra
+  shortDescription: Audit DMARC enforcement, rollout percentage, aggregate reporting, SPF record count and MX presence before onboarding a domain.
+  metaDescription: Audit DMARC policy strength, rollout, rua reporting, SPF records and MX presence with a real DNS query and structured evidence.
+  description: |
+    Validate an email domain's published DMARC, SPF and MX posture before onboarding or a security review. The flow queries actual DNS records, checks DMARC enforcement level and rollout percentage, verifies aggregate reporting configuration, detects missing or duplicated SPF records, and checks MX presence. It emits a JSON report and can notify Slack when configured requirements are not met.
+
+    ## How it works
+
+    1. The validation task checks the email domain and policy threshold.
+    2. The audit task queries the _dmarc TXT record, root TXT records and MX records using DNS.
+    3. The parser evaluates DMARC p and pct tags, checks rua reporting destinations, and counts SPF records.
+    4. It writes dmarc-spf-domain-audit.json with the observed DNS evidence and the final verdict.
+    5. The optional S3 branch archives evidence. The policy If alerts and fails when requirements are not met.
+
+    ## What you get
+
+    - DNS evidence for DMARC policy, rollout percentage, aggregate reporting, SPF records and MX records.
+    - Fail-closed handling for missing DMARC, weak enforcement, low rollout, missing reporting and duplicate SPF records.
+    - A machine-readable report for audit trails and optional S3 retention.
+    - A scheduled option for recurring email-domain posture reviews.
+
+    ## Who it's for
+
+    - Security and deliverability teams protecting domain reputation and spoofing defenses.
+    - Platform teams reviewing domains before onboarding email sending services.
+    - Compliance teams who require a traceable DNS posture assessment.
+
+    ## Why orchestrate this with Kestra
+
+    Kestra makes posture thresholds explicit, records each DNS audit as an execution, supports scheduled rechecks and routes findings to a security alert plus a failing task that downstream onboarding flows can depend on.
+
+    ## Prerequisites
+
+    - A Kestra 2.x worker with Docker enabled for Python Script tasks.
+    - Network access from the worker container to public DNS resolvers.
+    - A Slack incoming webhook for policy-failure and execution-error alerts.
+    - An S3 bucket and write-capable AWS credentials only when optional report archival is enabled.
+
+    ### Secrets
+
+    - SLACK_WEBHOOK_URL: Slack incoming webhook used for policy failures and execution errors.
+    - AWS_ACCESS_KEY_ID: optional AWS access key used only when S3 archival is enabled.
+    - AWS_SECRET_ACCESS_KEY: optional AWS secret key used only when S3 archival is enabled.
+
+    ## Quick start
+
+    1. Import the flow with domain=gmail.com and run it manually.
+    2. Review dmarc-spf-domain-audit.json, especially dmarcPolicy, dmarcPct, rua, SPF records and MX records.
+    3. Keep required_dmarc_policy at reject for strict enforcement, or set it to quarantine where policy allows.
+    4. Tune minimum_pct and require_aggregate_reporting for the organization's mail-security baseline.
+    5. Configure SLACK_WEBHOOK_URL before relying on blocking alerts and enable the weekly trigger after checking the initial evidence.
+
+    ## How to extend
+
+    - Query known DKIM selectors and validate published public keys alongside DMARC and SPF.
+    - Add SPF include-count and DNS lookup-budget analysis rather than checking only record count.
+    - Compare DMARC policy against approved sending services and route changes for reviewer approval.
+    - Track rua report delivery through an external mailbox or reporting provider.
+
+    ## Links
+
+    - [RFC 7489: Domain-based Message Authentication, Reporting and Conformance](https://www.rfc-editor.org/rfc/rfc7489)
+    - [RFC 7208: Sender Policy Framework](https://www.rfc-editor.org/rfc/rfc7208)
+    - [dnspython documentation](https://dnspython.readthedocs.io/en/stable/)
+    - [Kestra Python Script plugin](https://kestra.io/plugins/plugin-scripts/python)
+    - [Kestra Slack plugin](https://kestra.io/plugins/plugin-slack/slackincomingwebhook)
+    - [Kestra AWS S3 plugin](https://kestra.io/plugins/plugin-aws/s3)
+  tags:
+    - Infrastructure
+  subTags:
+    - Policy & Compliance
+    - Monitoring & Alerting
+  ee: false
+  demo: false
