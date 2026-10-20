@@ -331,7 +331,7 @@ tasks:
         region: "{{ inputs.aws_region }}"
         bucket: "{{ inputs.evidence_bucket }}"
         from: "{{ outputs.audit_sri_resources.outputFiles['subresource-integrity-report.json'] }}"
-        key: "{{ inputs.evidence_prefix }}/{{ inputs.repository | replace('/', '_') }}/subresource-integrity-{{ execution.id }}.json"
+        key: "{{ inputs.evidence_prefix }}/subresource-integrity-{{ execution.id }}.json"
 
   - id: enforce_sri_policy
     type: io.kestra.plugin.core.flow.If
