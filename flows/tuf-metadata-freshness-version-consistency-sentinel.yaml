@@ -108,6 +108,8 @@ tasks:
     containerImage: python:3.12-slim
     taskRunner:
       type: io.kestra.plugin.scripts.runner.docker.Docker
+    dependencies:
+      - kestra
     env:
       METADATA_BASE_URL: "{{ inputs.metadata_base_url }}"
       CONSISTENT_SNAPSHOT: "{{ inputs.consistent_snapshot }}"
