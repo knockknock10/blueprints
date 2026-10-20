@@ -27,7 +27,7 @@ inputs:
     type: BOOL
     displayName: Require secure contact methods
     defaults: true
-    description: Require Contact values to use mailto: or https: URIs.
+    description: Require Contact values to use mailto URIs or HTTPS URLs.
   - id: require_canonical
     type: BOOL
     displayName: Require Canonical field
