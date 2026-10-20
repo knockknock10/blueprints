@@ -1,0 +1,465 @@
+id: secure-archive-extraction-safety-gate
+namespace: company.infrastructure
+description: |
+  Inspect a public ZIP or TAR archive before a downstream job is allowed to extract it.
+  The flow downloads a bounded payload from an explicit HTTPS host allowlist, checks member
+  paths for traversal, flags links and special files, and enforces member-count, expanded-size,
+  and compression-ratio budgets. It writes a JSON report and can alert Slack or fail a strict
+  gate. It never extracts archive members itself.
+
+inputs:
+  - id: archive_url
+    type: STRING
+    displayName: Archive URL
+    defaults: https://github.com/octocat/Hello-World/archive/refs/heads/master.zip
+    description: HTTPS URL to a public ZIP or TAR archive. Every redirect must remain on an allowed public host.
+  - id: allowed_hosts
+    type: STRING
+    displayName: Allowed download hosts
+    defaults: github.com,codeload.github.com
+    description: Comma-separated exact hostnames permitted for the initial URL and each redirect.
+  - id: maximum_download_bytes
+    type: INT
+    displayName: Maximum downloaded bytes
+    defaults: 5000000
+    description: Maximum compressed archive size, from 1024 to 20000000 bytes.
+  - id: maximum_members
+    type: INT
+    displayName: Maximum archive members
+    defaults: 2000
+    description: Maximum number of files and directories described by the archive.
+  - id: maximum_expanded_bytes
+    type: INT
+    displayName: Maximum expanded bytes
+    defaults: 25000000
+    description: Maximum sum of member sizes declared in archive metadata.
+  - id: maximum_compression_ratio
+    type: INT
+    displayName: Maximum compression ratio
+    defaults: 100
+    description: Maximum declared expanded-size to compressed-download-size ratio.
+  - id: strict_mode
+    type: BOOL
+    displayName: Fail on blocking findings
+    defaults: true
+    description: When enabled, fail the flow if any blocking archive-safety finding is detected.
+  - id: notify_slack
+    type: BOOL
+    displayName: Send Slack alert on blocked archive
+    defaults: false
+    description: Enable only after adding SLACK_WEBHOOK_URL to the Kestra namespace.
+
+triggers:
+  - id: weekday_archive_audit
+    type: io.kestra.plugin.core.trigger.Schedule
+    description: Optional weekday audit schedule; disabled by default until the archive source and policy inputs are configured.
+    cron: "0 9 * * 1-5"
+    disabled: true
+
+tasks:
+  - id: validate_request
+    type: io.kestra.plugin.scripts.python.Script
+    description: Validate limits and the explicit host allowlist before any network request.
+    containerImage: python:3.12-slim
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+    env:
+      ARCHIVE_URL: "{{ inputs.archive_url }}"
+      ALLOWED_HOSTS: "{{ inputs.allowed_hosts }}"
+      MAX_DOWNLOAD_BYTES: "{{ inputs.maximum_download_bytes }}"
+      MAXIMUM_MEMBERS: "{{ inputs.maximum_members }}"
+      MAXIMUM_EXPANDED_BYTES: "{{ inputs.maximum_expanded_bytes }}"
+      MAXIMUM_COMPRESSION_RATIO: "{{ inputs.maximum_compression_ratio }}"
+    script: |
+      import os
+      import re
+      from urllib.parse import urlsplit
+
+      url = os.environ.get("ARCHIVE_URL", "").strip()
+      parsed = urlsplit(url)
+      if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
+          raise ValueError("archive_url must be an HTTPS URL without embedded credentials")
+      if parsed.port not in (None, 443):
+          raise ValueError("archive_url must use the default HTTPS port")
+      hosts = [h.strip().lower() for h in os.environ.get("ALLOWED_HOSTS", "").split(",") if h.strip()]
+      if not hosts or parsed.hostname.lower() not in hosts:
+          raise ValueError("the archive URL host must exactly match one of allowed_hosts")
+      if any(not re.fullmatch(r"[a-z0-9.-]+", host) or host.startswith(".") or host.endswith(".") for host in hosts):
+          raise ValueError("allowed_hosts must contain plain DNS hostnames, not wildcard or URL patterns")
+
+      bounds = {
+          "maximum_download_bytes": (int(os.environ["MAX_DOWNLOAD_BYTES"]), 1024, 20_000_000),
+          "maximum_members": (int(os.environ["MAXIMUM_MEMBERS"]), 1, 20_000),
+          "maximum_expanded_bytes": (int(os.environ["MAXIMUM_EXPANDED_BYTES"]), 1024, 250_000_000),
+          "maximum_compression_ratio": (int(os.environ["MAXIMUM_COMPRESSION_RATIO"]), 1, 1000),
+      }
+      for name, (value, minimum, maximum) in bounds.items():
+          if not minimum <= value <= maximum:
+              raise ValueError(f"{name} must be between {minimum} and {maximum}")
+      print("Archive URL, exact host allowlist, and all policy bounds are valid.")
+
+  - id: inspect_archive
+    type: io.kestra.plugin.scripts.python.Script
+    description: Download the archive with byte limits, validate every redirect destination, and inspect ZIP/TAR metadata without extracting members.
+    containerImage: python:3.12-slim
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+    dependencies:
+      - kestra
+    env:
+      ARCHIVE_URL: "{{ inputs.archive_url }}"
+      ALLOWED_HOSTS: "{{ inputs.allowed_hosts }}"
+      MAX_DOWNLOAD_BYTES: "{{ inputs.maximum_download_bytes }}"
+      MAXIMUM_MEMBERS: "{{ inputs.maximum_members }}"
+      MAXIMUM_EXPANDED_BYTES: "{{ inputs.maximum_expanded_bytes }}"
+      MAXIMUM_COMPRESSION_RATIO: "{{ inputs.maximum_compression_ratio }}"
+    outputFiles:
+      - archive-safety-report.json
+    script: |
+      import io
+      import ipaddress
+      import json
+      import os
+      import socket
+      import stat
+      import tarfile
+      import time
+      import urllib.error
+      import urllib.request
+      import zipfile
+      from datetime import datetime, timezone
+      from pathlib import PurePosixPath, PureWindowsPath
+      from urllib.parse import urljoin, urlsplit
+
+      from kestra import Kestra
+
+      source_url = os.environ["ARCHIVE_URL"].strip()
+      allowed_hosts = {
+          host.strip().lower()
+          for host in os.environ.get("ALLOWED_HOSTS", "").split(",")
+          if host.strip()
+      }
+      maximum_download_bytes = int(os.environ["MAX_DOWNLOAD_BYTES"])
+      maximum_members = int(os.environ["MAXIMUM_MEMBERS"])
+      maximum_expanded_bytes = int(os.environ["MAXIMUM_EXPANDED_BYTES"])
+      maximum_compression_ratio = int(os.environ["MAXIMUM_COMPRESSION_RATIO"])
+
+      findings = []
+      archive_kind = "unknown"
+      archive_bytes = 0
+      member_count = 0
+      expanded_bytes = 0
+      redirect_chain = []
+      unsafe_paths = []
+      link_members = []
+      special_members = []
+      encrypted_members = []
+      duplicate_paths = []
+      downloaded_url = None
+
+      def add(code, severity, message):
+          findings.append({"code": code, "severity": severity, "message": message})
+
+      def validate_public_https_url(url):
+          parsed = urlsplit(url)
+          if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
+              raise ValueError("redirect target must be HTTPS and must not contain embedded credentials")
+          if parsed.port not in (None, 443):
+              raise ValueError("redirect target used an unexpected port")
+          hostname = parsed.hostname.lower()
+          if hostname not in allowed_hosts:
+              raise ValueError(f"redirect host '{hostname}' is not present in the exact allowlist")
+          try:
+              addresses = socket.getaddrinfo(hostname, 443, type=socket.SOCK_STREAM)
+          except socket.gaierror as exc:
+              raise ValueError(f"could not resolve allowed host '{hostname}': {exc}") from exc
+          resolved = {entry[4][0] for entry in addresses}
+          if not resolved:
+              raise ValueError(f"host '{hostname}' did not resolve to an address")
+          for address in resolved:
+              parsed_ip = ipaddress.ip_address(address.split("%", 1)[0])
+              if not parsed_ip.is_global:
+                  raise ValueError(f"host '{hostname}' resolved to a non-public address")
+          return hostname
+
+      class AllowlistedRedirectHandler(urllib.request.HTTPRedirectHandler):
+          def redirect_request(self, req, fp, code, msg, headers, newurl):
+              target = urljoin(req.full_url, newurl)
+              hostname = validate_public_https_url(target)
+              redirect_chain.append({"from": req.full_url, "to": target, "host": hostname, "status": int(code)})
+              return super().redirect_request(req, fp, code, msg, headers, target)
+
+      report = {}
+      try:
+          validate_public_https_url(source_url)
+          opener = urllib.request.build_opener(AllowlistedRedirectHandler())
+          request = urllib.request.Request(
+              source_url,
+              headers={
+                  "User-Agent": "Kestra-Archive-Safety-Gate/1.0",
+                  "Accept": "application/octet-stream, application/zip, application/x-tar, */*",
+              },
+          )
+          started = time.monotonic()
+          with opener.open(request, timeout=20) as response:
+              downloaded_url = response.geturl()
+              validate_public_https_url(downloaded_url)
+              final_length = response.headers.get("Content-Length")
+              if final_length:
+                  try:
+                      if int(final_length) > maximum_download_bytes:
+                          raise ValueError(f"archive Content-Length exceeds maximum_download_bytes ({maximum_download_bytes})")
+                  except ValueError as exc:
+                      if "invalid literal" not in str(exc):
+                          raise
+                      add("CONTENT_LENGTH_INVALID", "BLOCK", "The response Content-Length header is not a valid integer.")
+              chunks = []
+              total_read = 0
+              while True:
+                  chunk = response.read(min(65536, maximum_download_bytes + 1 - total_read))
+                  if not chunk:
+                      break
+                  chunks.append(chunk)
+                  total_read += len(chunk)
+                  if total_read > maximum_download_bytes:
+                      raise ValueError(f"download exceeded maximum_download_bytes ({maximum_download_bytes})")
+              payload = b"".join(chunks)
+          archive_bytes = len(payload)
+          if time.monotonic() - started > 120:
+              add("DOWNLOAD_SLOW", "WARN", "Archive download took longer than 120 seconds.")
+          if not payload:
+              raise ValueError("downloaded archive is empty")
+
+          stream = io.BytesIO(payload)
+          if zipfile.is_zipfile(stream):
+              archive_kind = "zip"
+              normalized = {}
+              with zipfile.ZipFile(io.BytesIO(payload)) as archive:
+                  entries = archive.infolist()
+                  member_count = len(entries)
+                  if member_count > maximum_members:
+                      add("MEMBER_COUNT_EXCEEDED", "BLOCK", f"Archive has {member_count} members; limit is {maximum_members}.")
+                  for entry in entries:
+                      name = entry.filename
+                      posix_name = name.replace("\\", "/")
+                      posix_path = PurePosixPath(posix_name)
+                      windows_path = PureWindowsPath(name)
+                      if "\x00" in name or posix_path.is_absolute() or windows_path.is_absolute() or windows_path.drive or ".." in posix_path.parts:
+                          unsafe_paths.append(name[:300])
+                      canonical = str(posix_path).rstrip("/")
+                      if canonical:
+                          normalized.setdefault(canonical, []).append(name[:300])
+                      mode = (entry.external_attr >> 16) & 0xFFFF
+                      kind = stat.S_IFMT(mode)
+                      if stat.S_ISLNK(mode):
+                          link_members.append(name[:300])
+                      elif kind not in (0, stat.S_IFREG, stat.S_IFDIR):
+                          special_members.append(name[:300])
+                      if entry.flag_bits & 0x1:
+                          encrypted_members.append(name[:300])
+                      expanded_bytes += max(0, int(entry.file_size))
+              duplicate_paths = [values[0] for values in normalized.values() if len(values) > 1]
+          elif tarfile.is_tarfile(io.BytesIO(payload)):
+              archive_kind = "tar"
+              normalized = {}
+              with tarfile.open(fileobj=io.BytesIO(payload), mode="r:*") as archive:
+                  entries = archive.getmembers()
+                  member_count = len(entries)
+                  if member_count > maximum_members:
+                      add("MEMBER_COUNT_EXCEEDED", "BLOCK", f"Archive has {member_count} members; limit is {maximum_members}.")
+                  for entry in entries:
+                      name = entry.name
+                      posix_name = name.replace("\\", "/")
+                      posix_path = PurePosixPath(posix_name)
+                      windows_path = PureWindowsPath(name)
+                      if "\x00" in name or posix_path.is_absolute() or windows_path.is_absolute() or windows_path.drive or ".." in posix_path.parts:
+                          unsafe_paths.append(name[:300])
+                      canonical = str(posix_path).rstrip("/")
+                      if canonical:
+                          normalized.setdefault(canonical, []).append(name[:300])
+                      if entry.issym() or entry.islnk():
+                          link_members.append(name[:300])
+                      elif not (entry.isfile() or entry.isdir()):
+                          special_members.append(name[:300])
+                      expanded_bytes += max(0, int(entry.size))
+              duplicate_paths = [values[0] for values in normalized.values() if len(values) > 1]
+          else:
+              raise ValueError("download is neither a supported ZIP archive nor a TAR archive")
+
+          if unsafe_paths:
+              add("UNSAFE_MEMBER_PATH", "BLOCK", "Archive contains absolute, drive-qualified, NUL-containing, or parent-traversal paths: " + ", ".join(unsafe_paths[:20]))
+          if link_members:
+              add("LINK_MEMBERS_PRESENT", "BLOCK", "Archive contains symbolic or hard links: " + ", ".join(link_members[:20]))
+          if special_members:
+              add("SPECIAL_MEMBERS_PRESENT", "BLOCK", "Archive contains device, FIFO, or other non-regular members: " + ", ".join(special_members[:20]))
+          if encrypted_members:
+              add("ENCRYPTED_MEMBERS_PRESENT", "BLOCK", "Archive contains encrypted ZIP members that cannot be inspected safely: " + ", ".join(encrypted_members[:20]))
+          if duplicate_paths:
+              add("DUPLICATE_MEMBER_PATH", "BLOCK", "Archive contains duplicate normalized member paths: " + ", ".join(duplicate_paths[:20]))
+          if expanded_bytes > maximum_expanded_bytes:
+              add("EXPANDED_SIZE_EXCEEDED", "BLOCK", f"Declared expanded size {expanded_bytes} bytes exceeds the limit {maximum_expanded_bytes}.")
+          ratio = round(expanded_bytes / max(archive_bytes, 1), 2)
+          if ratio > maximum_compression_ratio:
+              add("COMPRESSION_RATIO_EXCEEDED", "BLOCK", f"Declared compression ratio {ratio} exceeds the limit {maximum_compression_ratio}.")
+          add("ARCHIVE_INSPECTED", "INFO", f"Inspected {member_count} {archive_kind.upper()} member(s) without extracting archive contents.")
+      except Exception as exc:
+          add("ARCHIVE_INSPECTION_FAILED", "BLOCK", str(exc)[:1000])
+
+      blocking = [item for item in findings if item["severity"] == "BLOCK"]
+      warnings = [item for item in findings if item["severity"] == "WARN"]
+      verdict = "FAIL" if blocking else ("PASS_WITH_WARNINGS" if warnings else "PASS")
+      report = {
+          "schemaVersion": 1,
+          "checkedAt": datetime.now(timezone.utc).isoformat(),
+          "sourceUrl": source_url,
+          "finalUrl": downloaded_url,
+          "redirectChain": redirect_chain,
+          "archiveType": archive_kind,
+          "archiveBytes": archive_bytes,
+          "memberCount": member_count,
+          "declaredExpandedBytes": expanded_bytes,
+          "declaredCompressionRatio": round(expanded_bytes / max(archive_bytes, 1), 2),
+          "maximumDownloadBytes": maximum_download_bytes,
+          "maximumMembers": maximum_members,
+          "maximumExpandedBytes": maximum_expanded_bytes,
+          "maximumCompressionRatio": maximum_compression_ratio,
+          "unsafePathCount": len(unsafe_paths),
+          "linkMemberCount": len(link_members),
+          "specialMemberCount": len(special_members),
+          "encryptedMemberCount": len(encrypted_members),
+          "duplicateMemberPathCount": len(duplicate_paths),
+          "findings": findings,
+          "blockingFindingCount": len(blocking),
+          "warningCount": len(warnings),
+          "verdict": verdict,
+          "scopeNote": "This flow inspects archive metadata and never extracts members. Declared expanded sizes and compression ratios are metadata checks; the gate does not prove every decompressed byte stream is benign.",
+      }
+      with open("archive-safety-report.json", "w", encoding="utf-8") as target:
+          json.dump(report, target, indent=2, ensure_ascii=False)
+      print(f"Archive extraction safety audit: type={archive_kind}, bytes={archive_bytes}, members={member_count}, expanded={expanded_bytes}, verdict={verdict}, blocking={len(blocking)}")
+      Kestra.outputs({
+          "source_url": source_url,
+          "final_url": downloaded_url or "",
+          "archive_type": archive_kind,
+          "archive_bytes": archive_bytes,
+          "member_count": member_count,
+          "declared_expanded_bytes": expanded_bytes,
+          "declared_compression_ratio": round(expanded_bytes / max(archive_bytes, 1), 2),
+          "blocking_finding_count": len(blocking),
+          "warning_count": len(warnings),
+          "verdict": verdict,
+          "findings": findings,
+      })
+
+  - id: notify_on_block
+    type: io.kestra.plugin.core.flow.If
+    description: Notify the configured team when archive safety policy reports blocking findings.
+    condition: "{{ inputs.notify_slack and outputs.inspect_archive.vars.blocking_finding_count > 0 }}"
+    then:
+      - id: send_archive_safety_alert
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        description: Send archive URL, detected hazards, and execution ID to Slack.
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        payload: |-
+          {{
+            {
+              "text": ":warning: Archive extraction safety gate blocked a download\nURL: " ~ outputs.inspect_archive.vars.source_url ~
+                "\nVerdict: " ~ outputs.inspect_archive.vars.verdict ~
+                "\nFindings: " ~ (outputs.inspect_archive.vars.findings | toJson) ~
+                "\nExecution: " ~ execution.id ~
+                "\nSee archive-safety-report.json for details."
+            } | toJson
+          }}
+
+  - id: enforce_policy
+    type: io.kestra.plugin.core.flow.If
+    description: Fail closed in strict mode when any blocking archive-safety finding is detected.
+    condition: "{{ inputs.strict_mode and outputs.inspect_archive.vars.blocking_finding_count > 0 }}"
+    then:
+      - id: fail_archive_safety_gate
+        type: io.kestra.plugin.core.execution.Fail
+        description: Stop downstream promotion when the archive is unsafe or could not be inspected.
+        errorMessage: "Archive extraction safety policy failed. Review archive-safety-report.json and the inspect_archive task output."
+    else:
+      - id: log_archive_verdict
+        type: io.kestra.plugin.core.log.Log
+        level: INFO
+        message: "Archive safety verdict={{ outputs.inspect_archive.vars.verdict }}; members={{ outputs.inspect_archive.vars.member_count }}; expandedBytes={{ outputs.inspect_archive.vars.declared_expanded_bytes }}."
+
+outputs:
+  - id: archive_safety_report
+    type: JSON
+    description: Machine-readable archive metadata, redirect chain, safety findings, and final verdict.
+    value: "{{ outputs.inspect_archive.vars | toJson }}"
+
+extend:
+  title: Secure Archive Extraction Safety Gate
+  metaTitle: Secure Archive Extraction Safety Gate | Kestra
+  shortDescription: Inspect public ZIP and TAR archives for traversal paths, links, special files, and decompression-budget violations before extraction.
+  metaDescription: Gate ZIP and TAR archives on safe paths, no links or special files, public HTTPS redirects, member limits, expanded size and compression ratios.
+  description: |
+    Inspect a remote ZIP or TAR archive before handing it to an extractor or downstream build. The flow uses an exact HTTPS hostname allowlist, validates redirect destinations against public DNS addresses, bounds downloaded bytes, and inspects archive member metadata for path traversal, links, special files, duplicate paths and oversized expansion budgets. It generates a JSON evidence report, can alert Slack, and can fail a strict promotion gate without extracting member contents.
+
+    ## How it works
+
+    1. The validation task checks the HTTPS URL, host allowlist and numeric safety limits.
+    2. The inspection task downloads a bounded payload, validates every redirect destination, and recognizes ZIP or TAR content from the actual bytes rather than trusting the filename.
+    3. It inspects member paths, link metadata, special file types, duplicate names, member counts, declared expanded size and compression ratio without writing archive members to disk.
+    4. The report records blocking findings and warnings. An optional Slack branch sends a detailed alert, and strict mode fails the flow when blocking findings exist.
+
+    ## What you get
+
+    - JSON evidence with the source/final URL, redirect chain, archive type, member counts, expansion budget, findings and verdict.
+    - Rejection of absolute paths, drive-qualified paths, parent traversal, links, encrypted ZIP entries, special files and duplicate normalized paths.
+    - Bounded download size and configurable limits for member count, declared expanded size and compression ratio.
+    - An optional Slack notification and a fail-closed strict gate for downstream promotion.
+
+    ## Who it's for
+
+    - Platform teams processing third-party source and release archives.
+    - Security engineers reviewing build inputs before extraction.
+    - Data-ingestion teams that accept externally managed ZIP or TAR bundles.
+
+    ## Why orchestrate this with Kestra
+
+    Kestra records the input, report, task-level status and policy outcome in one traceable execution. A visible strict gate and optional alert make it easy to place the inspection before build, ingestion or deployment tasks without embedding safety logic into every consumer.
+
+    ## Prerequisites
+
+    - A Kestra 2.x worker with Docker available for the Python Script runner.
+    - Network access from the worker to the explicitly allowed public HTTPS hosts.
+    - Configure the allowlist for the actual upstream source before using another archive endpoint.
+
+    ### Secrets
+
+    - SLACK_WEBHOOK_URL: Slack incoming webhook; required only when notify_slack is enabled.
+
+    ## Quick start
+
+    1. Import the flow and run the default public GitHub ZIP example.
+    2. Review archive-safety-report.json and the archive_safety_report output.
+    3. Add the exact download and redirect hostnames to allowed_hosts; broad wildcards are not supported.
+    4. Choose member, size and compression-ratio limits appropriate for the archive producer.
+    5. Configure SLACK_WEBHOOK_URL before enabling notifications, and keep the scheduled trigger disabled until the source and policy are approved.
+
+    ## How to extend
+
+    - Add a trusted checksum or detached-signature verification step before inspection.
+    - Compare archive members against an expected manifest of files and digests.
+    - Quarantine accepted bundles to object storage before passing them to an isolated extractor.
+    - Add repository-specific required-file policies for software release archives.
+
+    ## Links
+
+    - [Python zipfile documentation](https://docs.python.org/3/library/zipfile.html)
+    - [Python tarfile documentation](https://docs.python.org/3/library/tarfile.html)
+    - [Python urllib request documentation](https://docs.python.org/3/library/urllib.request.html)
+    - [Kestra Python Script plugin](https://kestra.io/plugins/plugin-scripts/python)
+    - [Kestra Slack plugin](https://kestra.io/plugins/plugin-slack/slackincomingwebhook)
+  tags:
+    - Infrastructure
+  subTags:
+    - Policy & Compliance
+    - Testing & Quality
+  ee: false
+  demo: false
