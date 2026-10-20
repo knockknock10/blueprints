@@ -87,25 +87,7 @@ tasks:
 
       print(f"Validated public HTTPS target host={url.hostname}; resolved public addresses={len(addresses)}.")
 
-  - id: fetch_security_headers
-    type: io.kestra.plugin.core.http.Request
-    description: Make a real request to the configured public endpoint. Redirects are not followed so an unexpected redirect cannot silently change the audited destination.
-    uri: "{{ inputs.target_url }}"
-    method: GET
-    headers:
-      User-Agent: Kestra-HTTP-Security-Header-Posture-Gate/1.0
-      Accept: text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8
-    options:
-      followRedirects: false
-      retryOnStatusCodes:
-        - 429
-        - 500
-        - 502
-        - 503
-        - 504
-    timeout: PT30S
-
-  - id: audit_header_posture
+  - id: fetch_and_audit_header_posture
     type: io.kestra.plugin.scripts.python.Script
     description: Normalize response header names, evaluate required controls, and write JSON evidence without storing the page body.
     containerImage: python:3.12-slim
@@ -113,8 +95,6 @@ tasks:
       type: io.kestra.plugin.scripts.runner.docker.Docker
     env:
       TARGET_URL: "{{ inputs.target_url }}"
-      RESPONSE_CODE: "{{ outputs.fetch_security_headers.code }}"
-      RESPONSE_HEADERS: "{{ outputs.fetch_security_headers.headers | toJson }}"
       REQUIRED_HEADERS: "{{ inputs.required_headers | toJson }}"
       REQUIRE_FRAME_PROTECTION: "{{ inputs.require_frame_protection }}"
       REQUIRE_CSP: "{{ inputs.require_content_security_policy }}"
@@ -124,23 +104,60 @@ tasks:
     dependencies:
       - kestra
     script: |
+      import ipaddress
       import json
       import os
       import re
+      import socket
+      import urllib.error
+      import urllib.request
       from datetime import datetime, timezone
+      from urllib.parse import urlsplit
 
       from kestra import Kestra
 
       target_url = os.environ["TARGET_URL"]
-      status_code = int(os.environ.get("RESPONSE_CODE", "0"))
-      raw_headers = json.loads(os.environ.get("RESPONSE_HEADERS", "{}"))
       required_headers = json.loads(os.environ.get("REQUIRED_HEADERS", "[]"))
+
+      # Re-check DNS immediately before the request and never follow redirects.
+      parsed_url = urlsplit(target_url)
+      addresses = sorted({
+          result[4][0]
+          for result in socket.getaddrinfo(parsed_url.hostname, parsed_url.port or 443, type=socket.SOCK_STREAM)
+      })
+      if not addresses or any(not ipaddress.ip_address(address).is_global for address in addresses):
+          raise ValueError("The target must resolve only to public IP addresses at request time.")
+
+      class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+          def redirect_request(self, request, response, code, message, headers, new_url):
+              return None
+
+      request = urllib.request.Request(target_url, headers={
+          "User-Agent": "Kestra-HTTP-Security-Header-Posture-Gate/1.0",
+          "Accept": "text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8",
+      }, method="GET")
+      opener = urllib.request.build_opener(NoRedirectHandler())
+      try:
+          with opener.open(request, timeout=30) as response:
+              status_code = int(response.getcode())
+              raw_headers = {
+                  name.lower(): response.headers.get_all(name) or [response.headers.get(name, "")]
+                  for name in set(response.headers.keys())
+              }
+      except urllib.error.HTTPError as response_error:
+          status_code = int(response_error.code)
+          response_headers = response_error.headers
+          raw_headers = ({
+              name.lower(): response_headers.get_all(name) or [response_headers.get(name, "")]
+              for name in set(response_headers.keys())
+          } if response_headers is not None else {})
+          response_error.close()
       require_frame = os.environ.get("REQUIRE_FRAME_PROTECTION", "true").lower() == "true"
       require_csp = os.environ.get("REQUIRE_CSP", "false").lower() == "true"
       minimum_hsts_age = int(os.environ.get("MINIMUM_HSTS_MAX_AGE", "15552000"))
 
       if not isinstance(raw_headers, dict):
-          raise ValueError("HTTP response headers were not represented as a JSON object")
+          raise ValueError("HTTP response headers were not represented as a mapping")
       if not isinstance(required_headers, list) or not all(isinstance(header, str) for header in required_headers):
           raise ValueError("required_headers must be a JSON array of header names")
 
@@ -170,7 +187,7 @@ tasks:
       hsts = headers.get("strict-transport-security", "")
       hsts_age = None
       if hsts:
-          match = re.search(r"(?:^|;)\\s*max-age\\s*=\\s*(\\d+)", hsts, flags=re.IGNORECASE)
+          match = re.search(r"(?:^|;)\s*max-age\s*=\s*(\d+)", hsts, flags=re.IGNORECASE)
           if match:
               hsts_age = int(match.group(1))
               if hsts_age < minimum_hsts_age:
@@ -196,7 +213,7 @@ tasks:
           add("WARN", "CSP_WILDCARD_DEFAULT_SRC", "Content-Security-Policy uses a wildcard default-src.")
 
       x_frame = headers.get("x-frame-options", "").strip().lower()
-      has_frame_ancestors = bool(re.search(r"(?:^|;)\\s*frame-ancestors\\s+", csp, flags=re.IGNORECASE))
+      has_frame_ancestors = bool(re.search(r"(?:^|;)\s*frame-ancestors\s+", csp, flags=re.IGNORECASE))
       has_frame_protection = x_frame in {"deny", "sameorigin"} or has_frame_ancestors
       if not has_frame_protection:
           add("BLOCK" if require_frame else "WARN", "CLICKJACKING_PROTECTION_MISSING", "Neither X-Frame-Options: DENY/SAMEORIGIN nor a Content-Security-Policy frame-ancestors directive was found.")
@@ -251,17 +268,17 @@ tasks:
   - id: enforce_header_policy
     type: io.kestra.plugin.core.flow.If
     description: Optionally fail the execution when required security controls are missing; report-only mode remains useful during initial rollout.
-    condition: "{{ inputs.fail_on_missing_required_headers and outputs.audit_header_posture.vars.verdict == 'BLOCK' }}"
+    condition: "{{ inputs.fail_on_missing_required_headers and outputs.fetch_and_audit_header_posture.vars.verdict == 'BLOCK' }}"
     then:
       - id: fail_header_gate
         type: io.kestra.plugin.core.execution.Fail
         description: Stop a downstream promotion flow when configured required response headers are missing.
-        errorMessage: "HTTP security-header posture gate blocked: {{ outputs.audit_header_posture.vars.blocking_finding_count }} blocking finding(s). Review security-header-report.json."
+        errorMessage: "HTTP security-header posture gate blocked: {{ outputs.fetch_and_audit_header_posture.vars.blocking_finding_count }} blocking finding(s). Review security-header-report.json."
     else:
       - id: log_header_verdict
         type: io.kestra.plugin.core.log.Log
         level: INFO
-        message: "HTTP security-header audit {{ outputs.audit_header_posture.vars.verdict }} for {{ inputs.target_url }}; status={{ outputs.audit_header_posture.vars.http_status_code }}, warnings={{ outputs.audit_header_posture.vars.warning_count }}."
+        message: "HTTP security-header audit {{ outputs.fetch_and_audit_header_posture.vars.verdict }} for {{ inputs.target_url }}; status={{ outputs.fetch_and_audit_header_posture.vars.http_status_code }}, warnings={{ outputs.fetch_and_audit_header_posture.vars.warning_count }}."
 
 extend:
   title: HTTP Security Header Posture Gate
@@ -274,9 +291,9 @@ extend:
     ## How it works
 
     1. The validation task checks the HTTPS URL and rejects destinations that resolve to non-public addresses.
-    2. The HTTP Request task sends a real GET request with redirects disabled, so a redirect cannot silently change the endpoint being audited.
-    3. The Python task normalizes response headers and evaluates required-header presence, HSTS max-age, clickjacking controls, CSP settings, referrer policy and browser capability restrictions.
-    4. A JSON report records the status code, headers, verdict and findings without storing the response body.
+    2. The Python audit task re-checks the public DNS resolution and sends a real GET request with redirects disabled.
+    3. It reads the response status and headers only, closes the response without downloading the page body, and evaluates required-header presence, HSTS max-age, clickjacking controls, CSP settings, referrer policy and browser capability restrictions.
+    4. A JSON report records the status code, headers, verdict and findings while avoiding a full-page response in Kestra's worker-result queue.
     5. The final If task optionally fails the execution when enforcement is enabled and blocking findings remain.
 
     ## What you get
@@ -309,7 +326,7 @@ extend:
     ## Quick start
 
     1. Import the flow and leave target_url set to the default public endpoint.
-    2. Execute it and inspect the audit_header_posture task output or security-header-report.json.
+    2. Execute it and inspect the fetch_and_audit_header_posture task output or security-header-report.json.
     3. Tune required_headers, require_frame_protection and require_content_security_policy to match your application's requirements.
     4. Review warnings and test the application after adjusting any browser security policy.
     5. Enable fail_on_missing_required_headers when the team is ready for blocking enforcement; enable weekly_header_posture_audit only after confirming the target.
