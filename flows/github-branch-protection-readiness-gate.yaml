@@ -148,6 +148,7 @@ tasks:
       COMMIT_URL: "{{ outputs.fetch_tip_commit.body | jq('.html_url') | first }}"
       SIGNATURE_VERIFIED: "{{ outputs.fetch_tip_commit.body | jq('.commit.verification.verified') | first }}"
       VERIFICATION_REASON: "{{ outputs.fetch_tip_commit.body | jq('.commit.verification.reason') | first }}"
+      COMMIT_SUBJECT: "{{ outputs.fetch_tip_commit.body | jq('.commit.message') | first }}"
     outputFiles:
       - branch-readiness-audit.json
     script: |
@@ -177,7 +178,7 @@ tasks:
       def add(code, severity, message):
           findings.append({"code": code, "severity": severity, "message": message})
 
-      if require_protection and not protected:
+      if require_protection and not branch_protected:
           add("BRANCH_NOT_PROTECTED", "BLOCK", "GitHub reports the target branch is not protected by branch protection or rulesets.")
       if require_verified_tip and signature_verified is not True:
           add("TIP_COMMIT_SIGNATURE_UNVERIFIED", "BLOCK", f"GitHub does not verify the tip commit signature (reason: {verification_reason or 'unknown'}).")
@@ -195,11 +196,11 @@ tasks:
           "repository": repository,
           "branch": branch_name,
           "branchUrl": branch_url,
-          "branchProtected": protected,
+          "branchProtected": branch_protected,
           "requiredBranchProtection": require_protection,
           "tipCommitSha": commit_sha,
           "tipCommitUrl": commit_url,
-          "tipCommitSubject": commit_subject,
+          "tipCommitSubject": os.environ.get("COMMIT_SUBJECT", "").strip().splitlines()[0][:240],
           "tipCommitSignatureVerified": signature_verified,
           "tipCommitVerificationReason": verification_reason,
           "requiredVerifiedTipCommit": require_verified_tip,
@@ -212,11 +213,11 @@ tasks:
       with open("branch-readiness-audit.json", "w", encoding="utf-8") as target:
           json.dump(report, target, indent=2, ensure_ascii=False)
 
-      print(f"GitHub branch-readiness audit: {repository}@{branch_name} verdict={verdict}; protected={protected}, tip_signature_verified={signature_verified}, blocking={len(blocking)}, warnings={len(warnings)}")
+      print(f"GitHub branch-readiness audit: {repository}@{branch_name} verdict={verdict}; protected={branch_protected}, tip_signature_verified={signature_verified}, blocking={len(blocking)}, warnings={len(warnings)}")
       Kestra.outputs({
           "repository": repository,
           "branch": branch_name,
-          "branch_protected": protected,
+          "branch_protected": branch_protected,
           "tip_commit_sha": commit_sha,
           "tip_commit_url": commit_url,
           "tip_commit_signature_verified": signature_verified,
