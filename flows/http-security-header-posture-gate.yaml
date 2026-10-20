@@ -62,7 +62,9 @@ tasks:
       import socket
       from urllib.parse import urlsplit
 
-      url = urlsplit(TARGET_URL if False else __import__("os").environ.get("TARGET_URL", "").strip())
+      import os
+
+      url = urlsplit(os.environ.get("TARGET_URL", "").strip())
       if url.scheme.lower() != "https" or not url.hostname:
           raise ValueError("target_url must be an absolute HTTPS URL")
       if url.username or url.password or url.port not in (None, 443):
@@ -331,6 +333,6 @@ extend:
     - Infrastructure
   subTags:
     - Monitoring & Alerting
-    - Policy & Compliance
+    - CI/CD & Deployment
   ee: false
   demo: false
