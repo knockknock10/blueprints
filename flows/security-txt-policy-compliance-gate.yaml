@@ -1,0 +1,450 @@
+id: security-txt-policy-compliance-gate
+namespace: company.security
+description: |
+  Check a public website's security.txt disclosure policy at /.well-known/security.txt, with an
+  optional root-path fallback. The flow validates contact methods, parses the Expires timestamp,
+  checks the file's size and content type, detects expiry and short remaining validity, and emits
+  a JSON report. It does not contact listed security teams or imply that a valid file proves a
+  vulnerability-reporting process is operational.
+
+inputs:
+  - id: domain
+    type: STRING
+    displayName: Public website hostname
+    defaults: www.mozilla.org
+    description: Hostname only, without scheme, path, credentials or port.
+  - id: minimum_validity_days
+    type: INT
+    displayName: Minimum remaining validity
+    defaults: 30
+    description: Block when Expires is sooner than this many days from the audit time.
+  - id: allow_root_fallback
+    type: BOOL
+    displayName: Check root security.txt fallback
+    defaults: true
+    description: If the well-known path returns 404, also try /security.txt on the same hostname.
+  - id: require_https_contacts
+    type: BOOL
+    displayName: Require secure contact methods
+    defaults: true
+    description: Require Contact values to use mailto: or https: URIs.
+  - id: require_canonical
+    type: BOOL
+    displayName: Require Canonical field
+    defaults: false
+    description: Block if the file has no Canonical field. Keep disabled where the site policy does not require it.
+  - id: archive_report
+    type: BOOL
+    displayName: Archive report to S3
+    defaults: false
+    description: Store the JSON compliance report in S3. AWS credentials are required only when enabled.
+  - id: evidence_bucket
+    type: STRING
+    displayName: S3 evidence bucket
+    defaults: my-security-txt-evidence
+    description: Existing S3 bucket for optional evidence retention.
+  - id: evidence_prefix
+    type: STRING
+    displayName: S3 evidence prefix
+    defaults: security-txt-audits
+    description: Object key prefix for the domain audit reports.
+  - id: aws_region
+    type: STRING
+    displayName: AWS region
+    defaults: eu-west-1
+    description: Region containing the evidence bucket.
+
+triggers:
+  - id: weekly_security_txt_audit
+    type: io.kestra.plugin.core.trigger.Schedule
+    description: Recheck disclosure-policy expiry weekly. Enable only after reviewing alerts and the selected host.
+    cron: "0 7 * * 1"
+    disabled: true
+
+tasks:
+  - id: validate_public_domain
+    type: io.kestra.plugin.scripts.python.Script
+    description: Validate the hostname, policy bounds and public DNS resolution before any request. Reject IP literals, localhost and non-global DNS answers to reduce SSRF risk.
+    containerImage: python:3.12-slim
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+    env:
+      DOMAIN: "{{ inputs.domain }}"
+      MINIMUM_VALIDITY_DAYS: "{{ inputs.minimum_validity_days }}"
+    script: |
+      import ipaddress
+      import os
+      import re
+      import socket
+
+      domain = os.environ.get("DOMAIN", "").strip().lower().rstrip(".")
+      days = int(os.environ.get("MINIMUM_VALIDITY_DAYS", "30"))
+
+      if not re.fullmatch(r"(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}", domain):
+          raise ValueError("domain must be a DNS hostname only, without scheme, path, credentials or port")
+      if not 0 <= days <= 3650:
+          raise ValueError("minimum_validity_days must be between 0 and 3650")
+
+      try:
+          answers = socket.getaddrinfo(domain, 443, type=socket.SOCK_STREAM)
+      except OSError as exc:
+          raise ValueError(f"domain DNS resolution failed: {exc}") from exc
+      addresses = sorted({entry[4][0] for entry in answers})
+      if not addresses:
+          raise ValueError("domain resolved to no IP addresses")
+      non_public = []
+      for address in addresses:
+          ip = ipaddress.ip_address(address.split("%", 1)[0])
+          if not ip.is_global:
+              non_public.append(address)
+      if non_public:
+          raise ValueError("domain resolves to non-global address(es); refusing to fetch it: " + ", ".join(non_public))
+
+      print(f"Validated public hostname {domain}; DNS answers are globally routable and minimum expiry window is {days} days.")
+
+  - id: audit_security_txt
+    type: io.kestra.plugin.scripts.python.Script
+    description: Fetch and validate security.txt over HTTPS with same-host redirects, a size limit, explicit Contact and Expires checks, and a machine-readable report.
+    containerImage: python:3.12-slim
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+    dependencies:
+      - kestra
+    env:
+      DOMAIN: "{{ inputs.domain }}"
+      MINIMUM_VALIDITY_DAYS: "{{ inputs.minimum_validity_days }}"
+      ALLOW_ROOT_FALLBACK: "{{ inputs.allow_root_fallback }}"
+      REQUIRE_HTTPS_CONTACTS: "{{ inputs.require_https_contacts }}"
+      REQUIRE_CANONICAL: "{{ inputs.require_canonical }}"
+    outputFiles:
+      - security-txt-audit.json
+    script: |
+      import ipaddress
+      import json
+      import os
+      import re
+      import socket
+      import urllib.error
+      import urllib.parse
+      import urllib.request
+      from datetime import datetime, timezone, timedelta
+      from email.utils import parsedate_to_datetime
+
+      from kestra import Kestra
+
+      domain = os.environ["DOMAIN"].strip().lower().rstrip(".")
+      minimum_days = int(os.environ.get("MINIMUM_VALIDITY_DAYS", "30"))
+      root_fallback = os.environ.get("ALLOW_ROOT_FALLBACK", "true").lower() == "true"
+      require_https_contacts = os.environ.get("REQUIRE_HTTPS_CONTACTS", "true").lower() == "true"
+      require_canonical = os.environ.get("REQUIRE_CANONICAL", "false").lower() == "true"
+      now = datetime.now(timezone.utc)
+
+      def assert_public_dns(host):
+          if not host or host.lower() in {"localhost", "localhost.localdomain"}:
+              raise ValueError("refusing localhost or empty redirect host")
+          answers = socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)
+          addresses = {entry[4][0] for entry in answers}
+          if not addresses:
+              raise ValueError(f"{host} resolved to no IP addresses")
+          for address in addresses:
+              ip = ipaddress.ip_address(address.split("%", 1)[0])
+              if not ip.is_global:
+                  raise ValueError(f"refusing non-global redirect address {address}")
+
+      class SameHostHTTPSRedirectHandler(urllib.request.HTTPRedirectHandler):
+          def redirect_request(self, req, fp, code, msg, headers, newurl):
+              parsed = urllib.parse.urlparse(newurl)
+              if parsed.scheme.lower() != "https" or parsed.hostname is None or parsed.hostname.lower() != domain:
+                  raise urllib.error.URLError("redirect left the original HTTPS hostname")
+              assert_public_dns(parsed.hostname)
+              return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+      assert_public_dns(domain)
+      opener = urllib.request.build_opener(SameHostHTTPSRedirectHandler())
+      candidates = [f"https://{domain}/.well-known/security.txt"]
+      if root_fallback:
+          candidates.append(f"https://{domain}/security.txt")
+
+      selected_url = None
+      final_url = None
+      body = None
+      content_type = ""
+      status_code = None
+      errors_seen = []
+      for url in candidates:
+          request = urllib.request.Request(
+              url,
+              headers={
+                  "Accept": "text/plain",
+                  "User-Agent": "Kestra-SecurityTxt-Policy-Audit/1.0",
+              },
+              method="GET",
+          )
+          try:
+              with opener.open(request, timeout=15) as response:
+                  final_url = response.geturl()
+                  parsed_final = urllib.parse.urlparse(final_url)
+                  if parsed_final.scheme.lower() != "https" or parsed_final.hostname is None or parsed_final.hostname.lower() != domain:
+                      raise ValueError("final response URL is not HTTPS on the original hostname")
+                  content_type = response.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
+                  data = response.read(65537)
+                  status_code = response.status
+                  if len(data) > 65536:
+                      raise ValueError("security.txt exceeds the 65536-byte safety limit")
+                  if status_code != 200:
+                      errors_seen.append(f"{url} returned HTTP {status_code}")
+                      continue
+                  selected_url = url
+                  body = data.decode("utf-8-sig", errors="replace")
+                  break
+          except urllib.error.HTTPError as exc:
+              if exc.code in (404, 410):
+                  errors_seen.append(f"{url} returned HTTP {exc.code}")
+                  continue
+              raise RuntimeError(f"security.txt request failed for {url}: HTTP {exc.code}") from exc
+          except urllib.error.URLError as exc:
+              raise RuntimeError(f"security.txt request failed for {url}: {exc.reason}") from exc
+
+      findings = []
+      def add(code, severity, message):
+          findings.append({"code": code, "severity": severity, "message": message})
+
+      fields = {}
+      if body is None:
+          add("SECURITY_TXT_NOT_FOUND", "BLOCK", "Neither the well-known path nor an enabled root fallback returned a security.txt file. " + "; ".join(errors_seen))
+          raw_lines = []
+      else:
+          if content_type not in {"text/plain", "application/octet-stream"}:
+              add("UNEXPECTED_CONTENT_TYPE", "WARN", f"Expected text/plain, received {content_type or 'no Content-Type header'}.")
+          raw_lines = body.splitlines()
+          for number, line in enumerate(raw_lines, start=1):
+              stripped = line.strip()
+              if not stripped or stripped.startswith("#"):
+                  continue
+              if ":" not in stripped:
+                  add("MALFORMED_FIELD_LINE", "WARN", f"Line {number} has no colon and was ignored.")
+                  continue
+              key, value = stripped.split(":", 1)
+              key = key.strip()
+              value = value.strip()
+              if not key or not value:
+                  add("EMPTY_FIELD", "WARN", f"Line {number} has an empty field name or value.")
+                  continue
+              fields.setdefault(key.lower(), []).append(value)
+
+          contacts = fields.get("contact", [])
+          if not contacts:
+              add("CONTACT_MISSING", "BLOCK", "The file has no Contact field.")
+          else:
+              invalid_contacts = []
+              for contact in contacts:
+                  parsed = urllib.parse.urlparse(contact)
+                  if parsed.scheme.lower() == "mailto":
+                      if not parsed.path or "@" not in parsed.path:
+                          invalid_contacts.append(contact)
+                  elif parsed.scheme.lower() == "https":
+                      if not parsed.netloc:
+                          invalid_contacts.append(contact)
+                  elif require_https_contacts:
+                      invalid_contacts.append(contact)
+              if invalid_contacts:
+                  add("CONTACT_URI_INVALID", "BLOCK", "Contact values must be valid mailto or HTTPS URIs: " + ", ".join(invalid_contacts[:20]))
+
+          expires_values = fields.get("expires", [])
+          if len(expires_values) != 1:
+              add("EXPIRES_FIELD_INVALID_COUNT", "BLOCK", f"Exactly one Expires field is required; found {len(expires_values)}.")
+          else:
+              raw_expires = expires_values[0]
+              expires_at = None
+              try:
+                  expires_at = datetime.fromisoformat(raw_expires.replace("Z", "+00:00"))
+              except ValueError:
+                  try:
+                      expires_at = parsedate_to_datetime(raw_expires)
+                  except (TypeError, ValueError, OverflowError):
+                      expires_at = None
+              if expires_at is None or expires_at.tzinfo is None:
+                  add("EXPIRES_TIMESTAMP_INVALID", "BLOCK", "Expires must be a valid timezone-aware timestamp.")
+              else:
+                  expires_at = expires_at.astimezone(timezone.utc)
+                  remaining = expires_at - now
+                  if remaining.total_seconds() <= 0:
+                      add("SECURITY_TXT_EXPIRED", "BLOCK", f"Expires timestamp is in the past: {expires_at.isoformat()}.")
+                  elif remaining < timedelta(days=minimum_days):
+                      add("SECURITY_TXT_EXPIRING_SOON", "BLOCK", f"Only {remaining.days} day(s) remain before Expires; policy requires at least {minimum_days} days.")
+          if require_canonical and not fields.get("canonical"):
+              add("CANONICAL_FIELD_MISSING", "BLOCK", "The configured policy requires at least one Canonical field.")
+
+      blocking = [item for item in findings if item["severity"] == "BLOCK"]
+      warnings = [item for item in findings if item["severity"] == "WARN"]
+      verdict = "FAIL" if blocking else ("PASS_WITH_WARNINGS" if warnings else "PASS")
+      report = {
+          "schemaVersion": 1,
+          "checkedAt": now.isoformat(),
+          "domain": domain,
+          "requestedUrl": selected_url,
+          "finalUrl": final_url,
+          "httpStatus": status_code,
+          "contentType": content_type,
+          "byteCount": len(body.encode("utf-8")) if body is not None else 0,
+          "contact": fields.get("contact", []),
+          "expires": fields.get("expires", []),
+          "canonical": fields.get("canonical", []),
+          "fields": fields,
+          "findings": findings,
+          "blockingFindingCount": len(blocking),
+          "warningCount": len(warnings),
+          "minimumValidityDays": minimum_days,
+          "verdict": verdict,
+          "scopeNote": "This checks the public text file and selected structural policy only. It does not verify that contacts respond, validate a person's identity, or prove that a vulnerability disclosure workflow is operational.",
+      }
+      with open("security-txt-audit.json", "w", encoding="utf-8") as target:
+          json.dump(report, target, indent=2, ensure_ascii=False)
+
+      print(f"security.txt audit: {domain} verdict={verdict}; URL={final_url or 'not found'}, contacts={len(fields.get('contact', []))}, blocking={len(blocking)}, warnings={len(warnings)}")
+      Kestra.outputs({
+          "domain": domain,
+          "file_found": body is not None,
+          "final_url": final_url or "",
+          "http_status": status_code if status_code is not None else 0,
+          "contact_count": len(fields.get("contact", [])),
+          "expires": fields.get("expires", [""])[0] if fields.get("expires") else "",
+          "blocking_finding_count": len(blocking),
+          "warning_count": len(warnings),
+          "verdict": verdict,
+          "findings": findings,
+      })
+
+  - id: optionally_archive_report
+    type: io.kestra.plugin.core.flow.If
+    description: Optionally archive the security.txt compliance report in S3 using the audited domain as a key.
+    condition: "{{ inputs.archive_report }}"
+    then:
+      - id: upload_security_txt_audit
+        type: io.kestra.plugin.aws.s3.Upload
+        description: Store the public disclosure-policy report; no credentials or browser content are included.
+        accessKeyId: "{{ secret('AWS_ACCESS_KEY_ID') }}"
+        secretKeyId: "{{ secret('AWS_SECRET_ACCESS_KEY') }}"
+        region: "{{ inputs.aws_region }}"
+        bucket: "{{ inputs.evidence_bucket }}"
+        from: "{{ outputs.audit_security_txt.outputFiles['security-txt-audit.json'] }}"
+        key: "{{ inputs.evidence_prefix }}/{{ inputs.domain }}/security-txt-audit.json"
+
+  - id: enforce_security_txt_policy
+    type: io.kestra.plugin.core.flow.If
+    description: Fail the policy gate and alert when Contact, Expires, or other configured checks fail.
+    condition: "{{ outputs.audit_security_txt.vars.verdict == 'FAIL' }}"
+    then:
+      - id: alert_security_txt_policy_failure
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        description: Send the hostname, selected file URL and findings to the disclosure or platform team.
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        payload: |-
+          {{
+            {
+              "text": ":rotating_light: security.txt compliance policy failed\nDomain: " ~ outputs.audit_security_txt.vars.domain ~
+                "\nFile: " ~ outputs.audit_security_txt.vars.final_url ~
+                "\nExpires: " ~ outputs.audit_security_txt.vars.expires ~
+                "\nFindings: " ~ (outputs.audit_security_txt.vars.findings | toJson) ~
+                "\nExecution: " ~ execution.id ~
+                "\nReview security-txt-audit.json before marking the policy compliant."
+            } | toJson
+          }}
+      - id: fail_security_txt_policy
+        type: io.kestra.plugin.core.execution.Fail
+        description: Fail the workflow so downstream compliance or release steps cannot mistake an invalid policy file for a pass.
+        errorMessage: "security.txt compliance policy failed for {{ inputs.domain }}. Review security-txt-audit.json."
+    else:
+      - id: log_security_txt_verdict
+        type: io.kestra.plugin.core.log.Log
+        level: INFO
+        message: "security.txt compliance policy {{ outputs.audit_security_txt.vars.verdict }} for {{ outputs.audit_security_txt.vars.domain }}; contacts={{ outputs.audit_security_txt.vars.contact_count }}, expires={{ outputs.audit_security_txt.vars.expires }}."
+
+errors:
+  - id: alert_security_txt_execution_failure
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    description: Alert if DNS validation, HTTP fetching, parsing or orchestration fails; a technical error is never treated as compliance.
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    payload: |-
+      {{
+        {
+          "text": ":warning: security.txt audit execution failed\nDomain: " ~ inputs.domain ~
+            "\nExecution: " ~ execution.id ~
+            "\nInspect task logs; do not consider a failed audit compliant."
+        } | toJson
+      }}
+
+extend:
+  title: Security.txt Disclosure Policy Compliance Gate
+  metaTitle: Security.txt Disclosure Policy Compliance Gate | Kestra
+  shortDescription: Audit a public site's security.txt contact and expiry fields with a fail-closed policy, structured evidence and optional Slack/S3 integration.
+  metaDescription: Check a public website's security.txt contact methods, HTTPS content, expiry window, fallback path and optional canonical policy before release.
+  description: |
+    Validate a public website's security.txt disclosure metadata before marking its security contact information compliant. The flow verifies public DNS resolution, requests the well-known file over HTTPS, optionally uses the documented root fallback, checks the content size and media type, and validates Contact and Expires fields. It outputs JSON evidence, fails the configured policy when the file is missing or invalid, sends a Slack alert on findings that block compliance, and optionally archives the report in S3. It does not claim that contacts respond or that the site has a functioning vulnerability handling process.
+
+    ## How it works
+
+    1. The validation task checks the hostname, expiry threshold and DNS answers, refusing localhost, IP literals and non-public address results.
+    2. The audit task fetches /.well-known/security.txt over HTTPS, follows only same-host HTTPS redirects, and optionally falls back to /security.txt after a 404 or 410.
+    3. The file parser validates Contact values, requires exactly one timezone-aware Expires timestamp, evaluates the remaining validity window, and optionally requires Canonical.
+    4. The task writes security-txt-audit.json and structured outputs with findings and the final verdict.
+    5. The optional S3 branch archives evidence, while the policy If alerts and fails on blocking findings or logs the compliance verdict.
+
+    ## What you get
+
+    - A JSON report with the selected file URL, status, content type, contacts, expiry, canonical values and findings.
+    - Fail-closed handling when security.txt is missing, expired, poorly formed or close to expiry.
+    - An SSRF-conscious DNS and redirect policy to avoid probing private network addresses.
+    - Optional Slack alerting and S3 evidence retention.
+
+    ## Who it's for
+
+    - Product security and vulnerability disclosure teams reviewing public disclosure metadata.
+    - Platform engineers adding disclosure checks to release and compliance workflows.
+    - Security governance teams monitoring whether published contact details remain current.
+
+    ## Why orchestrate this with Kestra
+
+    Kestra makes expiry thresholds and file-location policy explicit, records each audit execution, schedules rechecks and routes failures to a visible alert plus a failing task that downstream release workflows can depend on.
+
+    ## Prerequisites
+
+    - A Kestra 2.x worker with Docker enabled for Python Script tasks.
+    - Network egress from the script container to the target public hostname over HTTPS and to its public DNS.
+    - A Slack incoming webhook for alerts.
+    - An S3 bucket and write-capable AWS credentials only when optional report archival is enabled.
+
+    ### Secrets
+
+    - SLACK_WEBHOOK_URL: Slack incoming webhook for policy failures and execution errors.
+    - AWS_ACCESS_KEY_ID: optional AWS access key used only when S3 archival is enabled.
+    - AWS_SECRET_ACCESS_KEY: optional AWS secret key used only when S3 archival is enabled.
+
+    ## Quick start
+
+    1. Import the flow with domain=www.mozilla.org and run it manually first.
+    2. Review security-txt-audit.json, particularly Contact and Expires and whether the file came from the well-known path or fallback.
+    3. Tune minimum_validity_days to match the organization's rotation/renewal policy and enable root fallback only if desired.
+    4. Configure SLACK_WEBHOOK_URL before relying on blocking alerts.
+    5. Enable the weekly trigger only after confirming the threshold and alert response. Enable S3 archival after configuring its secrets and bucket.
+
+    ## How to extend
+
+    - Check additional fields against an organization-specific disclosure policy and report unknown extension fields without treating them as malformed.
+    - Compare Canonical values against a domain allowlist maintained in Git.
+    - Route expiry warnings to an issue tracker and assign a remediation deadline.
+    - Archive periodic reports for audit evidence and detect changes in contacts across runs.
+
+    ## Links
+
+    - [RFC 9116: A File Format to Aid in Security Vulnerability Disclosure](https://www.rfc-editor.org/rfc/rfc9116)
+    - [Kestra Python Script plugin](https://kestra.io/plugins/plugin-scripts/python)
+    - [Kestra Slack plugin](https://kestra.io/plugins/plugin-slack/slackincomingwebhook)
+    - [Kestra AWS S3 plugin](https://kestra.io/plugins/plugin-aws/s3)
+  tags:
+    - Infrastructure
+  subTags:
+    - Policy & Compliance
+    - Monitoring & Alerting
+  ee: false
+  demo: false
