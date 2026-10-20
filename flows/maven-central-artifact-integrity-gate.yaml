@@ -1,0 +1,435 @@
+id: maven-central-artifact-integrity-gate
+namespace: company.infrastructure
+description: |
+  Audit a Maven Central artifact before it is introduced or promoted. Resolve a pinned
+  group, artifact and version to the Maven repository URL, download a bounded artifact,
+  compare its bytes with the published SHA-256 sidecar, and check whether an OpenPGP
+  detached signature sidecar is published. The JSON report separates checksum integrity
+  from signature-sidecar presence; it does not cryptographically verify OpenPGP signatures
+  or prove the artifact was built from reviewed source.
+
+inputs:
+  - id: group_id
+    type: STRING
+    displayName: Maven group ID
+    defaults: org.apache.commons
+    description: Group ID using dot-separated Java package-style segments.
+  - id: artifact_id
+    type: STRING
+    displayName: Maven artifact ID
+    defaults: commons-lang3
+    description: Artifact ID at Maven Central.
+  - id: version
+    type: STRING
+    displayName: Exact artifact version
+    defaults: 3.17.0
+    description: Pinned version to audit. Avoid dynamic versions such as LATEST or RELEASE.
+  - id: packaging
+    type: STRING
+    displayName: Artifact packaging
+    defaults: jar
+    description: Maven Central file extension, usually jar or pom.
+  - id: maximum_artifact_bytes
+    type: INT
+    displayName: Maximum artifact download bytes
+    defaults: 5000000
+    description: Safety limit for artifact downloads, from 1 to 10000000 bytes.
+  - id: fail_on_missing_checksum
+    type: BOOL
+    displayName: Fail if SHA-256 sidecar is missing
+    defaults: false
+    description: When true, absence of the published SHA-256 sidecar becomes a blocking finding.
+  - id: fail_on_missing_signature
+    type: BOOL
+    displayName: Fail if OpenPGP signature sidecar is missing
+    defaults: false
+    description: When true, absence of the .asc detached signature sidecar becomes a blocking finding.
+  - id: strict_mode
+    type: BOOL
+    displayName: Enforce artifact integrity policy
+    defaults: false
+    description: When true, fail the flow when blocking findings are recorded.
+  - id: notify_slack
+    type: BOOL
+    displayName: Send Slack alerts
+    defaults: false
+    description: Enable only after configuring SLACK_WEBHOOK_URL in the Kestra namespace.
+  - id: archive_report
+    type: BOOL
+    displayName: Archive report to S3
+    defaults: false
+    description: Store the JSON audit report in S3. AWS credentials are required only when enabled.
+  - id: evidence_bucket
+    type: STRING
+    displayName: S3 evidence bucket
+    defaults: my-maven-integrity-evidence
+    description: Existing S3 bucket used only when report archival is enabled.
+  - id: evidence_prefix
+    type: STRING
+    displayName: S3 evidence prefix
+    defaults: maven-central-artifact-audits
+    description: Prefix for Maven artifact audit reports.
+  - id: aws_region
+    type: STRING
+    displayName: AWS region
+    defaults: eu-west-1
+    description: Region containing the evidence bucket.
+
+triggers:
+  - id: weekday_artifact_integrity_audit
+    type: io.kestra.plugin.core.trigger.Schedule
+    description: Re-audit the pinned Maven artifact each weekday. Enable after deciding the checksum/signature policy and configuring optional integrations.
+    cron: "0 12 * * 1-5"
+    disabled: true
+
+tasks:
+  - id: validate_artifact_coordinates
+    type: io.kestra.plugin.scripts.python.Script
+    description: Validate Maven coordinates and the download-size cap before making network requests.
+    containerImage: python:3.12-slim
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+    env:
+      GROUP_ID: "{{ inputs.group_id }}"
+      ARTIFACT_ID: "{{ inputs.artifact_id }}"
+      VERSION: "{{ inputs.version }}"
+      PACKAGING: "{{ inputs.packaging }}"
+      MAXIMUM_ARTIFACT_BYTES: "{{ inputs.maximum_artifact_bytes }}"
+    script: |
+      import os
+      import re
+
+      group_id = os.environ.get("GROUP_ID", "").strip()
+      artifact_id = os.environ.get("ARTIFACT_ID", "").strip()
+      version = os.environ.get("VERSION", "").strip()
+      packaging = os.environ.get("PACKAGING", "").strip().lower()
+      try:
+          max_bytes = int(os.environ.get("MAXIMUM_ARTIFACT_BYTES", "5000000"))
+      except ValueError as exc:
+          raise ValueError("maximum_artifact_bytes must be an integer") from exc
+
+      if not re.fullmatch(r"[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*", group_id):
+          raise ValueError("group_id must contain dot-separated alphanumeric, underscore, or hyphen segments")
+      for field_name, value in (("artifact_id", artifact_id), ("version", version)):
+          if not re.fullmatch(r"[A-Za-z0-9_.+-]+", value) or value in {".", ".."}:
+              raise ValueError(f"{field_name} contains unsupported path characters")
+      if packaging not in {"jar", "pom", "war", "zip"}:
+          raise ValueError("packaging must be one of jar, pom, war, or zip")
+      if not 1 <= max_bytes <= 10000000:
+          raise ValueError("maximum_artifact_bytes must be between 1 and 10000000")
+      print(f"Validated Maven coordinates {group_id}:{artifact_id}:{version} ({packaging}) with {max_bytes}-byte download limit.")
+
+  - id: audit_maven_artifact
+    type: io.kestra.plugin.scripts.python.Script
+    description: Download the pinned Maven Central artifact with a strict byte limit, verify the published SHA-256 sidecar against the actual bytes, and check whether a PGP signature file is available.
+    containerImage: python:3.12-slim
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+    dependencies:
+      - kestra
+    env:
+      GROUP_ID: "{{ inputs.group_id }}"
+      ARTIFACT_ID: "{{ inputs.artifact_id }}"
+      VERSION: "{{ inputs.version }}"
+      PACKAGING: "{{ inputs.packaging }}"
+      MAXIMUM_ARTIFACT_BYTES: "{{ inputs.maximum_artifact_bytes }}"
+      FAIL_ON_MISSING_CHECKSUM: "{{ inputs.fail_on_missing_checksum }}"
+      FAIL_ON_MISSING_SIGNATURE: "{{ inputs.fail_on_missing_signature }}"
+    outputFiles:
+      - maven-artifact-integrity-report.json
+    script: |
+      import hashlib
+      import json
+      import os
+      import re
+      from datetime import datetime, timezone
+      from urllib.error import HTTPError, URLError
+      from urllib.request import Request, urlopen
+      from kestra import Kestra
+
+      group_id = os.environ["GROUP_ID"].strip()
+      artifact_id = os.environ["ARTIFACT_ID"].strip()
+      version = os.environ["VERSION"].strip()
+      packaging = os.environ["PACKAGING"].strip().lower()
+      maximum_bytes = int(os.environ.get("MAXIMUM_ARTIFACT_BYTES", "5000000"))
+      fail_missing_checksum = os.environ.get("FAIL_ON_MISSING_CHECKSUM", "false").lower() == "true"
+      fail_missing_signature = os.environ.get("FAIL_ON_MISSING_SIGNATURE", "false").lower() == "true"
+
+      group_path = group_id.replace(".", "/")
+      base = f"https://repo.maven.apache.org/maven2/{group_path}/{artifact_id}/{version}/{artifact_id}-{version}"
+      artifact_url = f"{base}.{packaging}"
+      checksum_url = artifact_url + ".sha256"
+      signature_url = artifact_url + ".asc"
+      findings = []
+
+      def add(code, severity, message):
+          findings.append({"code": code, "severity": severity, "message": message})
+
+      def fetch(url, limit):
+          request = Request(url, headers={
+              "User-Agent": "Kestra-Maven-Central-Artifact-Integrity-Gate/1.0",
+              "Accept": "*/*",
+          })
+          with urlopen(request, timeout=40) as response:
+              status = response.status
+              final_url = response.geturl()
+              payload = response.read(limit + 1)
+          if not final_url.startswith("https://repo.maven.apache.org/"):
+              raise ValueError(f"Repository request redirected outside repo.maven.apache.org: {final_url}")
+          if len(payload) > limit:
+              raise ValueError(f"Response exceeded configured {limit}-byte limit: {url}")
+          return payload, status, final_url
+
+      artifact_bytes = None
+      artifact_status = None
+      artifact_sha256 = None
+      try:
+          artifact_bytes, artifact_status, final_url = fetch(artifact_url, maximum_bytes)
+          artifact_sha256 = hashlib.sha256(artifact_bytes).hexdigest()
+      except HTTPError as exc:
+          if exc.code == 404:
+              add("ARTIFACT_NOT_FOUND", "BLOCK", f"Artifact not found at the pinned Maven Central URL: {artifact_url}")
+          else:
+              add("ARTIFACT_DOWNLOAD_FAILED", "BLOCK", f"Artifact download returned HTTP {exc.code}.")
+      except (URLError, TimeoutError, OSError, ValueError) as exc:
+          add("ARTIFACT_DOWNLOAD_FAILED", "BLOCK", f"Artifact download failed: {exc}")
+
+      published_sha256 = None
+      checksum_matches = None
+      checksum_present = False
+      if artifact_bytes is not None:
+          try:
+              checksum_bytes, checksum_status, _ = fetch(checksum_url, 4096)
+              checksum_text = checksum_bytes.decode("ascii", "replace").strip()
+              match = re.match(r"^([0-9a-fA-F]{64})(?:\s+.*)?$", checksum_text)
+              if not match:
+                  add("CHECKSUM_FORMAT_INVALID", "BLOCK", "SHA-256 sidecar did not start with a 64-character hexadecimal digest.")
+              else:
+                  checksum_present = True
+                  published_sha256 = match.group(1).lower()
+                  checksum_matches = published_sha256 == artifact_sha256
+                  if not checksum_matches:
+                      add("CHECKSUM_MISMATCH", "BLOCK", "The artifact's SHA-256 digest does not match the published .sha256 sidecar.")
+          except HTTPError as exc:
+              if exc.code == 404:
+                  add("CHECKSUM_SIDECAR_MISSING", "BLOCK" if fail_missing_checksum else "WARN", "Maven Central did not expose a .sha256 sidecar for this artifact.")
+              else:
+                  add("CHECKSUM_FETCH_FAILED", "BLOCK", f"Checksum sidecar request returned HTTP {exc.code}.")
+          except (URLError, TimeoutError, OSError, ValueError) as exc:
+              add("CHECKSUM_FETCH_FAILED", "BLOCK", f"Could not read the SHA-256 sidecar: {exc}")
+
+      signature_present = False
+      signature_bytes = None
+      try:
+          signature_bytes, signature_status, _ = fetch(signature_url, 131072)
+          signature_present = bool(signature_bytes.strip())
+          if not signature_present:
+              add("SIGNATURE_SIDECAR_EMPTY", "BLOCK" if fail_missing_signature else "WARN", "The .asc signature sidecar exists but is empty.")
+      except HTTPError as exc:
+          if exc.code == 404:
+              add("SIGNATURE_SIDECAR_MISSING", "BLOCK" if fail_missing_signature else "WARN", "Maven Central did not expose a detached .asc signature sidecar for this artifact.")
+          else:
+              add("SIGNATURE_FETCH_FAILED", "BLOCK", f"Signature sidecar request returned HTTP {exc.code}.")
+      except (URLError, TimeoutError, OSError, ValueError) as exc:
+          add("SIGNATURE_FETCH_FAILED", "BLOCK", f"Could not check the .asc signature sidecar: {exc}")
+
+      blocking = [item for item in findings if item["severity"] == "BLOCK"]
+      warnings = [item for item in findings if item["severity"] == "WARN"]
+      verdict = "FAIL" if blocking else ("PASS_WITH_WARNINGS" if warnings else "PASS")
+      report = {
+          "schemaVersion": 1,
+          "checkedAt": datetime.now(timezone.utc).isoformat(),
+          "coordinates": {"groupId": group_id, "artifactId": artifact_id, "version": version, "packaging": packaging},
+          "artifactUrl": artifact_url,
+          "artifactHttpStatus": artifact_status,
+          "artifactBytes": len(artifact_bytes) if artifact_bytes is not None else None,
+          "artifactSha256": artifact_sha256,
+          "checksumUrl": checksum_url,
+          "checksumSidecarPresent": checksum_present,
+          "publishedSha256": published_sha256,
+          "checksumMatches": checksum_matches,
+          "signatureUrl": signature_url,
+          "signatureSidecarPresent": signature_present,
+          "signatureBytes": len(signature_bytes) if signature_bytes is not None else None,
+          "policy": {
+              "failOnMissingChecksum": fail_missing_checksum,
+              "failOnMissingSignature": fail_missing_signature,
+              "maximumArtifactBytes": maximum_bytes,
+          },
+          "findings": findings,
+          "blockingFindingCount": len(blocking),
+          "warningCount": len(warnings),
+          "verdict": verdict,
+          "scopeNote": "The flow verifies the downloaded artifact against the SHA-256 sidecar and records whether a detached .asc file exists. It does not cryptographically verify an OpenPGP signature or independently attest build provenance.",
+      }
+      with open("maven-artifact-integrity-report.json", "w", encoding="utf-8") as target:
+          json.dump(report, target, indent=2, ensure_ascii=False)
+
+      print(f"Maven Central artifact audit: {group_id}:{artifact_id}:{version}, sha256_match={checksum_matches}, signature_sidecar={signature_present}, verdict={verdict}, blocking={len(blocking)}, warnings={len(warnings)}")
+      print("Maven integrity findings: " + json.dumps(findings, ensure_ascii=False))
+      Kestra.outputs({
+          "group_id": group_id,
+          "artifact_id": artifact_id,
+          "version": version,
+          "artifact_url": artifact_url,
+          "artifact_sha256": artifact_sha256,
+          "checksum_sidecar_present": checksum_present,
+          "checksum_matches": checksum_matches,
+          "signature_sidecar_present": signature_present,
+          "blocking_finding_count": len(blocking),
+          "warning_count": len(warnings),
+          "verdict": verdict,
+          "findings": findings,
+      })
+
+  - id: optionally_archive_report
+    type: io.kestra.plugin.core.flow.If
+    description: Optionally retain artifact integrity evidence in S3.
+    condition: "{{ inputs.archive_report }}"
+    then:
+      - id: upload_artifact_report
+        type: io.kestra.plugin.aws.s3.Upload
+        description: Store the JSON audit report, not the downloaded dependency binary.
+        accessKeyId: "{{ secret('AWS_ACCESS_KEY_ID') }}"
+        secretKeyId: "{{ secret('AWS_SECRET_ACCESS_KEY') }}"
+        region: "{{ inputs.aws_region }}"
+        bucket: "{{ inputs.evidence_bucket }}"
+        from: "{{ outputs.audit_maven_artifact.outputFiles['maven-artifact-integrity-report.json'] }}"
+        key: "{{ inputs.evidence_prefix }}/{{ inputs.group_id | replace('.', '_') }}/{{ inputs.artifact_id }}/{{ inputs.version }}/maven-artifact-integrity-report.json"
+
+  - id: enforce_integrity_policy
+    type: io.kestra.plugin.core.flow.If
+    description: Apply fail-closed enforcement only when strict mode is enabled and the artifact audit has blocking findings.
+    condition: "{{ inputs.strict_mode and outputs.audit_maven_artifact.vars.verdict == 'FAIL' }}"
+    then:
+      - id: optionally_alert_integrity_failure
+        type: io.kestra.plugin.core.flow.If
+        description: Send an alert only when enabled and the webhook secret is configured.
+        condition: "{{ inputs.notify_slack }}"
+        then:
+          - id: alert_integrity_failure
+            type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+            description: Alert maintainers that the dependency integrity policy is blocked.
+            url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+            payload: |-
+              {{
+                {
+                  "text": ":warning: Maven artifact integrity policy BLOCKED\nArtifact: " ~ inputs.group_id ~ ":" ~ inputs.artifact_id ~ ":" ~ inputs.version ~
+                    "\nFindings: " ~ (outputs.audit_maven_artifact.vars.findings | toJson) ~
+                    "\nExecution: " ~ execution.id ~
+                    "\nReview maven-artifact-integrity-report.json before promoting the dependency."
+                } | toJson
+              }}
+      - id: fail_artifact_gate
+        type: io.kestra.plugin.core.execution.Fail
+        description: Stop downstream promotion when configured artifact integrity requirements are not met.
+        errorMessage: "Maven artifact integrity policy failed for {{ inputs.group_id }}:{{ inputs.artifact_id }}:{{ inputs.version }}. Review maven-artifact-integrity-report.json."
+    else:
+      - id: log_integrity_verdict
+        type: io.kestra.plugin.core.log.Log
+        level: INFO
+        message: "Maven artifact audit {{ outputs.audit_maven_artifact.vars.verdict }} for {{ inputs.group_id }}:{{ inputs.artifact_id }}:{{ inputs.version }}; sha256_match={{ outputs.audit_maven_artifact.vars.checksum_matches }}."
+
+errors:
+  - id: optionally_alert_execution_failure
+    type: io.kestra.plugin.core.flow.If
+    description: Send technical execution failure notifications only when enabled.
+    condition: "{{ inputs.notify_slack }}"
+    then:
+      - id: alert_execution_failure
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        description: Alert when API, download, parsing, or orchestration failures prevent an audit.
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        payload: |-
+          {{
+            {
+              "text": ":warning: Maven artifact audit execution failed\nCoordinates: " ~ inputs.group_id ~ ":" ~ inputs.artifact_id ~ ":" ~ inputs.version ~
+                "\nExecution: " ~ execution.id ~
+                "\nInspect Kestra logs; an execution failure is not a passing artifact-integrity result."
+            } | toJson
+          }}
+
+outputs:
+  - id: artifact_integrity_audit
+    type: JSON
+    description: Machine-readable artifact URL/hash, checksum-sidecar comparison, signature-sidecar presence, findings, and policy verdict.
+    value: "{{ outputs.audit_maven_artifact.vars | toJson }}"
+
+extend:
+  title: Maven Central Artifact Integrity Gate
+  metaTitle: Maven Central Artifact Integrity Gate | Kestra
+  shortDescription: Verify a pinned Maven artifact against its published SHA-256 sidecar and check the availability of a detached OpenPGP signature.
+  metaDescription: Audit Maven Central artifacts by downloading a pinned version, verifying the SHA-256 sidecar, and checking detached signature availability before promotion.
+  description: |
+    Validate a specific artifact from Maven Central before adding it to a build or promoting it downstream. The workflow downloads a pinned artifact within a configured size limit, computes its SHA-256 digest, compares that digest with the published checksum sidecar, and checks whether a detached OpenPGP signature file exists. It produces a JSON report with the artifact identity, checksum result, signature availability, and policy findings. Optional integrations can retain evidence in S3 and alert Slack.
+
+    ## How it works
+
+    1. Validate the group ID, artifact ID, pinned version, packaging, and download limit.
+    2. Construct the canonical Maven Central repository path from those coordinates.
+    3. Download the artifact within the maximum byte limit and calculate SHA-256.
+    4. Fetch the .sha256 sidecar and compare the published digest with the downloaded bytes.
+    5. Check for a detached .asc sidecar and report its presence without claiming cryptographic signature verification.
+    6. Optionally archive the evidence and enable strict-mode enforcement once the project's policy is defined.
+
+    ## What you get
+
+    - An immutable coordinate record and direct Maven Central artifact URL.
+    - A computed SHA-256 digest and explicit comparison with the repository checksum.
+    - Detection of missing checksum and detached-signature sidecars.
+    - Bounded artifact downloads to limit resource use.
+    - Optional S3 evidence retention, Slack alerts, and fail-closed policy enforcement.
+
+    ## Who it's for
+
+    - Java and JVM platform teams verifying dependencies before adoption.
+    - Release engineers maintaining a vetted list of third-party artifacts.
+    - Security and compliance teams retaining evidence of dependency integrity checks.
+
+    ## Why orchestrate this with Kestra
+
+    Kestra makes dependency checks reproducible and observable, retains evidence with each execution, and lets teams move from report-only mode to an enforced policy without maintaining a bespoke script or cron entry.
+
+    ## Prerequisites
+
+    - Kestra 2.x workers with Docker enabled for the Python Script task runner.
+    - Network access from workers to repo.maven.apache.org.
+    - Optional Slack incoming webhook and optional S3 bucket with write access.
+    - The artifact must be a published, pinned Maven Central version within the configured size limit.
+
+    ### Secrets
+
+    - SLACK_WEBHOOK_URL: optional Slack incoming webhook; required only when notify_slack is true.
+    - AWS_ACCESS_KEY_ID: optional AWS access key used only when report archival is enabled.
+    - AWS_SECRET_ACCESS_KEY: optional AWS secret key used only when report archival is enabled.
+
+    ## Quick start
+
+    1. Import the flow and start with org.apache.commons:commons-lang3:3.17.0.
+    2. Execute it and inspect artifact_integrity_audit and maven-artifact-integrity-report.json.
+    3. Review the checksum comparison and signature-sidecar finding for the pinned coordinate.
+    4. Set fail_on_missing_checksum and fail_on_missing_signature according to the repository's actual requirements.
+    5. Enable strict_mode only after verifying the initial output and configuring any alert/evidence secrets.
+
+    ## How to extend
+
+    - Compare the artifact against a separately trusted SHA-256 value stored in a reviewed manifest.
+    - Add cryptographic OpenPGP verification using an independently trusted publisher keyring.
+    - Audit a lockfile or SBOM and execute this check over a curated set of pinned coordinates.
+    - Add license, provenance-attestation and vulnerability checks as separate supply-chain gates.
+
+    ## Links
+
+    - [Maven Central repository layout](https://maven.apache.org/repository/layout.html)
+    - [Maven Central repository](https://repo.maven.apache.org/maven2/)
+    - [Maven deploy checksum and signature documentation](https://central.sonatype.org/publish/requirements/)
+    - [Kestra Python Script plugin](https://kestra.io/plugins/plugin-scripts/python)
+    - [Kestra Slack Incoming Webhook plugin](https://kestra.io/plugins/plugin-slack/slackincomingwebhook)
+    - [Kestra AWS S3 plugin](https://kestra.io/plugins/plugin-aws/s3)
+  tags:
+    - Infrastructure
+  subTags:
+    - Policy & Compliance
+    - CI/CD & Deployment
+  ee: false
+  demo: false
