@@ -31,8 +31,8 @@ inputs:
   - id: inspect_role_metadata
     type: BOOL
     displayName: Inspect metadata roles referenced by snapshot
-    defaults: true
-    description: Fetch role metadata listed in snapshot metadata and verify advertised versions, lengths and hashes.
+    defaults: false
+    description: Optionally fetch role metadata listed in snapshot metadata and verify advertised versions, lengths and hashes. Enable after confirming your metadata mirror publishes each referenced role file.
   - id: notify_slack
     type: BOOL
     displayName: Send Slack alerts
@@ -109,7 +109,7 @@ tasks:
 
   - id: inspect_tuf_metadata
     type: io.kestra.plugin.scripts.python.Script
-    description: Fetch timestamp, snapshot, and optional role metadata. Check expiry, version links, and advertised hashes/lengths. This monitor does not cryptographically verify signatures or a trusted-root chain.
+    description: Fetch timestamp and snapshot metadata by default; optionally inspect referenced role metadata. Check expiry, version links, and advertised hashes/lengths where present. This monitor does not cryptographically verify signatures or a trusted-root chain.
     containerImage: python:3.12-slim
     taskRunner:
       type: io.kestra.plugin.scripts.runner.docker.Docker
@@ -444,7 +444,7 @@ extend:
     1. Validate the HTTPS metadata endpoint and safety limits.
     2. Fetch timestamp.json, check its expiry and version floor, and resolve the referenced snapshot version.
     3. Fetch the referenced snapshot metadata, compare its version with the timestamp reference, and check expiry.
-    4. Optionally fetch role metadata referenced by the snapshot, compare advertised versions, and verify advertised SHA-256/SHA-512 hashes and lengths when those fields exist.
+    4. Optionally fetch role metadata referenced by the snapshot, compare advertised versions, and verify advertised SHA-256/SHA-512 hashes and lengths when those fields exist. Enable this only after confirming the configured mirror publishes all referenced role files.
     5. Archive the report if configured, then route a blocking verdict to Slack and a failed task.
 
     ## What you get
@@ -481,7 +481,7 @@ extend:
 
     1. Import the flow and keep metadata_base_url as https://tuf-repo-cdn.sigstore.dev for the public Sigstore TUF metadata example.
     2. Execute the flow and review the metadata_audit output and tuf-metadata-audit.json file.
-    3. Keep minimum_accepted_timestamp_version at zero until you have a trusted baseline; set it from trusted state to detect rollback below that number.
+    3. Keep inspect_role_metadata disabled for the first run if the metadata mirror publishes timestamp and snapshot files but not every delegated role. Enable it once you confirm the full role inventory is available. Keep minimum_accepted_timestamp_version at zero until you have a trusted baseline; set it from trusted state to detect rollback below that number.
     4. Adjust minimum_expiry_hours for your operating cadence and configure SLACK_WEBHOOK_URL before relying on alerts.
     5. Enable the schedule after reviewing the initial report. Enable S3 archival only after configuring the bucket and AWS secrets.
 
