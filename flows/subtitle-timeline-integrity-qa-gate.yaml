@@ -1,0 +1,487 @@
+id: subtitle-timeline-integrity-qa-gate
+namespace: company.media
+description: |
+  Validate SRT and WebVTT subtitle files before publication. The flow performs a bounded HTTPS
+  download, parses cue timing, and reports malformed timestamps, zero-length cues, out-of-order
+  starts, overlapping cues, missing text, excessive cue duration, and unsupported blocks. It emits
+  a JSON quality report, can notify Slack, and can fail a strict media-release gate without
+  rewriting or publishing the source subtitle file.
+
+inputs:
+  - id: subtitle_url
+    type: STRING
+    displayName: Subtitle file URL
+    defaults: https://raw.githubusercontent.com/mdn/content/main/files/en-us/learn_web_development/core/structuring_content/test_your_skills/audio_and_video/subtitles_en.vtt
+    description: HTTPS URL of an SRT or WebVTT subtitle file.
+  - id: allowed_hosts
+    type: STRING
+    displayName: Allowed download hosts
+    defaults: raw.githubusercontent.com
+    description: Comma-separated exact hostnames allowed for the source and each redirect.
+  - id: subtitle_format
+    type: STRING
+    displayName: Subtitle format
+    defaults: AUTO
+    description: AUTO detects from the file extension or WEBVTT header; otherwise select SRT or VTT.
+  - id: maximum_download_bytes
+    type: INT
+    displayName: Maximum subtitle bytes
+    defaults: 2000000
+    description: Maximum downloaded file size, from 1024 to 10000000 bytes.
+  - id: maximum_cues
+    type: INT
+    displayName: Maximum cue count
+    defaults: 20000
+    description: Maximum cues inspected, from 1 to 100000.
+  - id: maximum_cue_duration_seconds
+    type: INT
+    displayName: Maximum cue duration
+    defaults: 30
+    description: Block cues with a duration longer than this number of seconds, from 1 to 3600.
+  - id: allow_overlaps
+    type: BOOL
+    displayName: Allow overlapping cues
+    defaults: false
+    description: When false, block a cue that begins before the previous cue ends.
+  - id: strict_mode
+    type: BOOL
+    displayName: Fail on timing or format errors
+    defaults: true
+    description: When enabled, fail the flow when any blocking cue or file-quality finding exists.
+  - id: notify_slack
+    type: BOOL
+    displayName: Send Slack alert
+    defaults: false
+    description: Enable only after configuring SLACK_WEBHOOK_URL in the Kestra namespace.
+
+triggers:
+  - id: weekly_subtitle_quality_audit
+    type: io.kestra.plugin.core.trigger.Schedule
+    description: Optional weekly recheck of the configured subtitle source; disabled until the source and policy are approved.
+    cron: "0 9 * * 1"
+    disabled: true
+
+tasks:
+  - id: validate_request
+    type: io.kestra.plugin.scripts.python.Script
+    description: Validate the subtitle URL, host allowlist, format choice and scan limits before downloading data.
+    containerImage: python:3.12-slim
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+    env:
+      SUBTITLE_URL: "{{ inputs.subtitle_url }}"
+      ALLOWED_HOSTS: "{{ inputs.allowed_hosts }}"
+      SUBTITLE_FORMAT: "{{ inputs.subtitle_format }}"
+      MAXIMUM_DOWNLOAD_BYTES: "{{ inputs.maximum_download_bytes }}"
+      MAXIMUM_CUES: "{{ inputs.maximum_cues }}"
+      MAXIMUM_CUE_DURATION_SECONDS: "{{ inputs.maximum_cue_duration_seconds }}"
+    script: |
+      import os
+      from urllib.parse import urlsplit
+
+      url = os.environ.get("SUBTITLE_URL", "").strip()
+      parsed = urlsplit(url)
+      if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
+          raise ValueError("subtitle_url must be HTTPS without embedded credentials")
+      if parsed.port not in (None, 443):
+          raise ValueError("subtitle_url must use the default HTTPS port")
+      hosts = [item.strip().lower() for item in os.environ.get("ALLOWED_HOSTS", "").split(",") if item.strip()]
+      if not hosts or parsed.hostname.lower() not in hosts:
+          raise ValueError("the subtitle source host must exactly match one of allowed_hosts")
+      if any(not item.replace(".", "").replace("-", "").isalnum() for item in hosts):
+          raise ValueError("allowed_hosts must contain plain DNS hostnames")
+      if os.environ.get("SUBTITLE_FORMAT", "AUTO").upper() not in {"AUTO", "SRT", "VTT", "WEBVTT"}:
+          raise ValueError("subtitle_format must be AUTO, SRT, VTT, or WEBVTT")
+      bounds = {
+          "maximum_download_bytes": (int(os.environ["MAXIMUM_DOWNLOAD_BYTES"]), 1024, 10_000_000),
+          "maximum_cues": (int(os.environ["MAXIMUM_CUES"]), 1, 100_000),
+          "maximum_cue_duration_seconds": (int(os.environ["MAXIMUM_CUE_DURATION_SECONDS"]), 1, 3600),
+      }
+      for name, (value, minimum, maximum) in bounds.items():
+          if not minimum <= value <= maximum:
+              raise ValueError(f"{name} must be between {minimum} and {maximum}")
+      print("Subtitle source URL, allowlist, format selection and scan limits are valid.")
+
+  - id: inspect_subtitles
+    type: io.kestra.plugin.scripts.python.Script
+    description: Download bounded SRT/WebVTT text, validate every redirect destination, and inspect cue timestamps and text without modifying the source.
+    containerImage: python:3.12-slim
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+    dependencies:
+      - kestra
+    env:
+      SUBTITLE_URL: "{{ inputs.subtitle_url }}"
+      ALLOWED_HOSTS: "{{ inputs.allowed_hosts }}"
+      SUBTITLE_FORMAT: "{{ inputs.subtitle_format }}"
+      MAXIMUM_DOWNLOAD_BYTES: "{{ inputs.maximum_download_bytes }}"
+      MAXIMUM_CUES: "{{ inputs.maximum_cues }}"
+      MAXIMUM_CUE_DURATION_SECONDS: "{{ inputs.maximum_cue_duration_seconds }}"
+      ALLOW_OVERLAPS: "{{ inputs.allow_overlaps }}"
+    outputFiles:
+      - subtitle-quality-report.json
+    script: |
+      import ipaddress
+      import json
+      import os
+      import re
+      import socket
+      import time
+      import urllib.error
+      import urllib.parse
+      import urllib.request
+      from datetime import datetime, timezone
+
+      from kestra import Kestra
+
+      source_url = os.environ["SUBTITLE_URL"].strip()
+      allowed_hosts = {
+          item.strip().lower()
+          for item in os.environ.get("ALLOWED_HOSTS", "").split(",")
+          if item.strip()
+      }
+      requested_format = os.environ.get("SUBTITLE_FORMAT", "AUTO").upper()
+      maximum_download_bytes = int(os.environ["MAXIMUM_DOWNLOAD_BYTES"])
+      maximum_cues = int(os.environ["MAXIMUM_CUES"])
+      maximum_cue_duration = int(os.environ["MAXIMUM_CUE_DURATION_SECONDS"])
+      allow_overlaps = os.environ.get("ALLOW_OVERLAPS", "false").lower() == "true"
+
+      findings = []
+      redirect_chain = []
+      final_url = None
+      file_bytes = 0
+      subtitle_format = "unknown"
+      cue_count = 0
+      parsed_cues = []
+      timing_samples = []
+
+      def add(code, severity, message):
+          findings.append({"code": code, "severity": severity, "message": message})
+
+      def validate_public_https_url(url):
+          parsed = urllib.parse.urlsplit(url)
+          if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
+              raise ValueError("redirect target must be HTTPS without embedded credentials")
+          if parsed.port not in (None, 443):
+              raise ValueError("redirect target used an unexpected port")
+          hostname = parsed.hostname.lower()
+          if hostname not in allowed_hosts:
+              raise ValueError(f"redirect host '{hostname}' is not present in allowed_hosts")
+          try:
+              addresses = socket.getaddrinfo(hostname, 443, type=socket.SOCK_STREAM)
+          except socket.gaierror as exc:
+              raise ValueError(f"could not resolve allowed host '{hostname}': {exc}") from exc
+          resolved = {entry[4][0] for entry in addresses}
+          if not resolved:
+              raise ValueError(f"host '{hostname}' did not resolve")
+          for address in resolved:
+              parsed_ip = ipaddress.ip_address(address.split("%", 1)[0])
+              if not parsed_ip.is_global:
+                  raise ValueError(f"host '{hostname}' resolved to a non-public address")
+          return hostname
+
+      class AllowlistedRedirectHandler(urllib.request.HTTPRedirectHandler):
+          def redirect_request(self, req, fp, code, msg, headers, newurl):
+              target = urllib.parse.urljoin(req.full_url, newurl)
+              hostname = validate_public_https_url(target)
+              redirect_chain.append({"from": req.full_url, "to": target, "host": hostname, "status": int(code)})
+              return super().redirect_request(req, fp, code, msg, headers, target)
+
+      def parse_timestamp(value, is_vtt):
+          value = value.strip()
+          if is_vtt:
+              match = re.fullmatch(r"(?:(\d+):)?(\d{2}):(\d{2})\.(\d{3})", value)
+              if not match:
+                  return None
+              hours = int(match.group(1) or 0)
+              minutes = int(match.group(2))
+              seconds = int(match.group(3))
+              milliseconds = int(match.group(4))
+          else:
+              match = re.fullmatch(r"(\d{2,}):(\d{2}):(\d{2}),(\d{3})", value)
+              if not match:
+                  return None
+              hours = int(match.group(1))
+              minutes = int(match.group(2))
+              seconds = int(match.group(3))
+              milliseconds = int(match.group(4))
+          if minutes >= 60 or seconds >= 60 or milliseconds >= 1000:
+              return None
+          return hours * 3600 + minutes * 60 + seconds + milliseconds / 1000.0
+
+      started = time.monotonic()
+      try:
+          validate_public_https_url(source_url)
+          request = urllib.request.Request(
+              source_url,
+              headers={"User-Agent": "Kestra-Subtitle-Timeline-Gate/1.0", "Accept": "text/vtt, text/plain, */*"},
+          )
+          opener = urllib.request.build_opener(AllowlistedRedirectHandler())
+          with opener.open(request, timeout=20) as response:
+              final_url = response.geturl()
+              validate_public_https_url(final_url)
+              declared_length = response.headers.get("Content-Length")
+              if declared_length:
+                  try:
+                      if int(declared_length) > maximum_download_bytes:
+                          raise ValueError(f"Content-Length exceeds maximum_download_bytes ({maximum_download_bytes})")
+                  except ValueError as exc:
+                      if "invalid literal" not in str(exc):
+                          raise
+                      add("CONTENT_LENGTH_INVALID", "BLOCK", "Content-Length was not a valid integer.")
+              chunks = []
+              total = 0
+              while True:
+                  chunk = response.read(min(65536, maximum_download_bytes + 1 - total))
+                  if not chunk:
+                      break
+                  chunks.append(chunk)
+                  total += len(chunk)
+                  if total > maximum_download_bytes:
+                      raise ValueError(f"download exceeded maximum_download_bytes ({maximum_download_bytes})")
+              payload = b"".join(chunks)
+          file_bytes = len(payload)
+          text = payload.decode("utf-8-sig")
+          if not text.strip():
+              raise ValueError("subtitle file is empty")
+
+          if requested_format == "AUTO":
+              path = urllib.parse.urlsplit(final_url or source_url).path.lower()
+              if path.endswith(".srt"):
+                  subtitle_format = "srt"
+              elif path.endswith(".vtt") or text.lstrip().startswith("WEBVTT"):
+                  subtitle_format = "vtt"
+              else:
+                  add("FORMAT_AMBIGUOUS", "BLOCK", "Could not infer SRT or WebVTT format; set subtitle_format explicitly.")
+          else:
+              subtitle_format = "vtt" if requested_format in {"VTT", "WEBVTT"} else "srt"
+
+          is_vtt = subtitle_format == "vtt"
+          blocks = re.split(r"\r?\n[ \t]*\r?\n", text.strip())
+          for block_index, block in enumerate(blocks, start=1):
+              lines = [line.rstrip("\r") for line in block.splitlines()]
+              if not lines:
+                  continue
+              first = lines[0].strip()
+              if is_vtt and first.startswith("WEBVTT"):
+                  continue
+              if is_vtt and (first == "STYLE" or first == "REGION" or first.startswith("NOTE")):
+                  continue
+              timing_index = next((i for i, line in enumerate(lines) if "-->" in line), None)
+              if timing_index is None:
+                  if is_vtt and block_index == 1 and first.startswith("WEBVTT"):
+                      continue
+                  add("BLOCK_WITHOUT_TIMECODE", "WARN", f"Block {block_index} does not contain a cue timing line and was skipped.")
+                  continue
+              timing_line = lines[timing_index]
+              parts = timing_line.split("-->", 1)
+              left = parts[0].strip().split()
+              right = parts[1].strip().split()
+              start = parse_timestamp(left[0], is_vtt) if left else None
+              end = parse_timestamp(right[0], is_vtt) if right else None
+              if start is None or end is None:
+                  add("TIMECODE_INVALID", "BLOCK", f"Block {block_index} contains a malformed {subtitle_format.upper()} timecode.")
+                  continue
+              cue_text = "\n".join(lines[timing_index + 1:]).strip()
+              cue_count += 1
+              cue = {"block": block_index, "start": start, "end": end, "duration": end - start, "hasText": bool(cue_text)}
+              parsed_cues.append(cue)
+              if end <= start:
+                  add("CUE_DURATION_NONPOSITIVE", "BLOCK", f"Cue block {block_index} ends at or before its start.")
+              if not cue_text:
+                  add("CUE_TEXT_EMPTY", "BLOCK", f"Cue block {block_index} contains no subtitle text.")
+              if cue["duration"] > maximum_cue_duration:
+                  add("CUE_DURATION_EXCEEDED", "BLOCK", f"Cue block {block_index} lasts {cue['duration']:.3f}s, above the limit {maximum_cue_duration}s.")
+              if len(timing_samples) < 100:
+                  timing_samples.append({
+                      "block": block_index,
+                      "startSeconds": round(start, 3),
+                      "endSeconds": round(end, 3),
+                      "durationSeconds": round(end - start, 3),
+                      "hasText": bool(cue_text),
+                  })
+              if cue_count > maximum_cues:
+                  add("CUE_COUNT_EXCEEDED", "BLOCK", f"Subtitle file contains more than maximum_cues ({maximum_cues}).")
+                  break
+
+          if cue_count == 0:
+              add("NO_CUES_FOUND", "BLOCK", "No valid subtitle cue timecodes were found.")
+          out_of_order = 0
+          overlaps = 0
+          previous_start = None
+          previous_end = None
+          for cue in parsed_cues:
+              if previous_start is not None and cue["start"] < previous_start:
+                  out_of_order += 1
+              if previous_end is not None and cue["start"] < previous_end:
+                  overlaps += 1
+              previous_start = cue["start"]
+              previous_end = cue["end"]
+          if out_of_order:
+              add("CUE_START_OUT_OF_ORDER", "BLOCK", f"{out_of_order} cue(s) begin before the previous cue's start time.")
+          if overlaps and not allow_overlaps:
+              add("CUES_OVERLAP", "BLOCK", f"{overlaps} cue(s) start before the previous cue has ended.")
+          if time.monotonic() - started > 120:
+              add("DOWNLOAD_OR_PARSE_SLOW", "WARN", "Download and parsing took longer than 120 seconds.")
+      except urllib.error.HTTPError as exc:
+          detail = ""
+          try:
+              detail = exc.read(1000).decode("utf-8", "replace")
+          except Exception:
+              pass
+          add("SUBTITLE_FETCH_FAILED", "BLOCK", f"Source returned HTTP {exc.code}: {detail[:300]}")
+      except Exception as exc:
+          add("SUBTITLE_INSPECTION_FAILED", "BLOCK", str(exc)[:1000])
+
+      blocking = [item for item in findings if item["severity"] == "BLOCK"]
+      warnings = [item for item in findings if item["severity"] == "WARN"]
+      verdict = "FAIL" if blocking else ("PASS_WITH_WARNINGS" if warnings else "PASS")
+      report = {
+          "schemaVersion": 1,
+          "checkedAt": datetime.now(timezone.utc).isoformat(),
+          "sourceUrl": source_url,
+          "finalUrl": final_url,
+          "redirectChain": redirect_chain,
+          "subtitleFormat": subtitle_format,
+          "downloadBytes": file_bytes,
+          "cueCount": cue_count,
+          "maximumCues": maximum_cues,
+          "maximumCueDurationSeconds": maximum_cue_duration,
+          "outOfOrderCueCount": out_of_order if "out_of_order" in locals() else 0,
+          "overlapCueCount": overlaps if "overlaps" in locals() else 0,
+          "timingSamples": timing_samples,
+          "findings": findings,
+          "blockingFindingCount": len(blocking),
+          "warningCount": len(warnings),
+          "verdict": verdict,
+          "scopeNote": "This gate validates text cue timing and basic structure. It does not listen to media, judge translation quality, or prove visual synchronization with the underlying audio/video.",
+      }
+      with open("subtitle-quality-report.json", "w", encoding="utf-8") as target:
+          json.dump(report, target, indent=2, ensure_ascii=False)
+      print(f"Subtitle timeline audit: format={subtitle_format}, bytes={file_bytes}, cues={cue_count}, verdict={verdict}, blocking={len(blocking)}.")
+      Kestra.outputs({
+          "source_url": source_url,
+          "final_url": final_url or "",
+          "subtitle_format": subtitle_format,
+          "download_bytes": file_bytes,
+          "cue_count": cue_count,
+          "out_of_order_cue_count": report["outOfOrderCueCount"],
+          "overlap_cue_count": report["overlapCueCount"],
+          "blocking_finding_count": len(blocking),
+          "warning_count": len(warnings),
+          "verdict": verdict,
+          "findings": findings,
+      })
+
+  - id: notify_on_subtitle_failure
+    type: io.kestra.plugin.core.flow.If
+    description: Notify the configured channel when subtitle timing or structure violates the gate policy.
+    condition: "{{ inputs.notify_slack and outputs.inspect_subtitles.vars.blocking_finding_count > 0 }}"
+    then:
+      - id: send_subtitle_alert
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        description: Send source link, verdict and cue-finding summary to Slack.
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        payload: |-
+          {{
+            {
+              "text": ":warning: Subtitle timeline QA failed\nSource: " ~ outputs.inspect_subtitles.vars.source_url ~
+                "\nFormat: " ~ outputs.inspect_subtitles.vars.subtitle_format ~
+                "\nCue count: " ~ outputs.inspect_subtitles.vars.cue_count ~
+                "\nFindings: " ~ (outputs.inspect_subtitles.vars.findings | toJson) ~
+                "\nExecution: " ~ execution.id ~
+                "\nReview subtitle-quality-report.json."
+            } | toJson
+          }}
+
+  - id: enforce_subtitle_policy
+    type: io.kestra.plugin.core.flow.If
+    description: Fail closed in strict mode when cue times, order, durations, or text violate policy.
+    condition: "{{ inputs.strict_mode and outputs.inspect_subtitles.vars.blocking_finding_count > 0 }}"
+    then:
+      - id: fail_subtitle_gate
+        type: io.kestra.plugin.core.execution.Fail
+        description: Prevent a malformed subtitle track from being published or attached to a media asset.
+        errorMessage: "Subtitle timeline QA gate failed. Review subtitle-quality-report.json."
+    else:
+      - id: log_subtitle_verdict
+        type: io.kestra.plugin.core.log.Log
+        level: INFO
+        message: "Subtitle QA verdict={{ outputs.inspect_subtitles.vars.verdict }}; format={{ outputs.inspect_subtitles.vars.subtitle_format }}; cues={{ outputs.inspect_subtitles.vars.cue_count }}."
+
+outputs:
+  - id: subtitle_quality_report
+    type: JSON
+    description: Machine-readable cue count, timing samples, overlap/order counts and policy findings.
+    value: "{{ outputs.inspect_subtitles.vars | toJson }}"
+
+extend:
+  title: Subtitle Timeline Integrity and Quality Gate
+  metaTitle: Subtitle Timeline Integrity and Quality Gate | Kestra
+  shortDescription: Validate SRT and WebVTT cue timings, order, duration, overlap and text structure before media publication.
+  metaDescription: Gate SRT and WebVTT tracks on valid timecodes, ordered non-overlapping cues, non-empty text, cue limits and safe public downloads.
+  description: |
+    Validate a subtitle track before it is published or attached to a video. The flow downloads a bounded SRT or WebVTT file from an explicit public HTTPS host allowlist, parses cue timing, checks duration and ordering, detects overlaps and missing text, and writes a structured QA report. It can alert Slack and fail a strict publication gate without changing the input file.
+
+    ## How it works
+
+    1. The validation task checks the subtitle URL, exact host allowlist, format selection and file/cue limits.
+    2. The inspection task downloads the subtitle file while validating redirect destinations and public DNS resolution.
+    3. The parser recognizes SRT and WebVTT timecodes, skips WebVTT metadata blocks, and audits cue start/end ranges, text presence, ordering, and overlap.
+    4. The report includes bounded timing samples and categorized findings. Optional Slack alerting and strict mode run after the audit.
+
+    ## What you get
+
+    - A JSON report with source URL, detected format, byte size, cue count, order/overlap totals and findings.
+    - Detection of malformed timestamps, non-positive durations, missing subtitle text and excessively long cues.
+    - Configurable maximum file size, cue count and cue duration.
+    - Optional Slack alerts and a strict gate to stop publishing malformed subtitle files.
+
+    ## Who it's for
+
+    - Media platform teams publishing caption tracks with video assets.
+    - Localization teams checking translated subtitle deliverables.
+    - Accessibility and quality teams verifying machine-generated captions before release.
+
+    ## Why orchestrate this with Kestra
+
+    The subtitle QA report, schedule, alert and release decision are visible in one execution. Teams can use the same declared limits for different subtitle sources and require a passing run before attaching captions to a published video.
+
+    ## Prerequisites
+
+    - A Kestra 2.x worker with Docker enabled for the Python Script runner.
+    - Network access to the explicitly allowed public HTTPS subtitle host.
+    - A subtitle source in SRT or WebVTT format.
+
+    ### Secrets
+
+    - SLACK_WEBHOOK_URL: Slack incoming webhook; required only when notify_slack is enabled.
+
+    ## Quick start
+
+    1. Import this flow and run the public WebVTT sample configured in subtitle_url.
+    2. Inspect subtitle-quality-report.json and the subtitle_quality_report output.
+    3. Set subtitle_format to SRT or VTT explicitly when a URL has no recognizable suffix.
+    4. Adjust maximum_cues and maximum_cue_duration_seconds to match the media team's requirements.
+    5. Configure SLACK_WEBHOOK_URL before enabling notifications. Keep the schedule disabled until the source and policy are approved.
+
+    ## How to extend
+
+    - Compare subtitle end times with known media duration metadata.
+    - Add language-tag and cue-character checks for the target locale.
+    - Add a separate remediation step to normalize or export fixed cues; keep the source immutable.
+    - Attach an approved cue-quality report as a release artifact.
+
+    ## Links
+
+    - [WebVTT specification](https://www.w3.org/TR/webvtt1/)
+    - [SubRip subtitle format overview](https://en.wikipedia.org/wiki/SubRip)
+    - [Python urllib request documentation](https://docs.python.org/3/library/urllib.request.html)
+    - [Kestra Python Script plugin](https://kestra.io/plugins/plugin-scripts/python)
+    - [Kestra Slack plugin](https://kestra.io/plugins/plugin-slack/slackincomingwebhook)
+  tags:
+    - Data
+  subTags:
+    - Testing & Quality
+  ee: false
+  demo: false
