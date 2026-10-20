@@ -274,7 +274,21 @@ tasks:
                   continue
               filename = versioned_filename(role_name, expected_version)
               try:
-                  raw, document = fetch_metadata(filename)
+                  try:
+                      raw, document = fetch_metadata(filename)
+                  except Exception as versioned_error:
+                      # Some deployed TUF mirrors publish versioned timestamp/snapshot
+                      # files but serve delegated metadata by its unversioned name.
+                      # Only allow fallback when the parent advertises hash or length.
+                      if not consistent_snapshot or not (entry.get("hashes") or isinstance(entry.get("length"), int)):
+                          raise
+                      if "404" not in str(versioned_error):
+                          raise
+                      fallback_name = role_name
+                      add("UNVERSIONED_ROLE_METADATA_FALLBACK", "WARN",
+                          f"{filename} was not found; checking {fallback_name} against the snapshot's advertised version/hash/length.")
+                      raw, document = fetch_metadata(fallback_name)
+                      filename = fallback_name
                   signed = document["signed"]
                   if signed.get("version") != expected_version:
                       add("ROLE_VERSION_MISMATCH", "BLOCK", f"{filename} content version does not match snapshot version {expected_version}.")
@@ -285,6 +299,8 @@ tasks:
                   for algorithm, expected_hash in expected_hashes.items():
                       if algorithm in {"sha256", "sha512"} and hashlib.new(algorithm, raw).hexdigest() != expected_hash:
                           add("ROLE_HASH_MISMATCH", "BLOCK", f"{filename} does not match snapshot's {algorithm} digest.")
+                  if not expected_hashes and not isinstance(entry.get("length"), int):
+                      add("ROLE_IDENTITY_UNVERIFIABLE", "BLOCK", f"{filename} has no parent-advertised hash or length to verify downloaded bytes.")
               except Exception as exc:
                   add("ROLE_METADATA_FETCH_FAILED", "BLOCK", f"{filename}: {exc}")
 
