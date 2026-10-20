@@ -136,14 +136,18 @@ tasks:
       type: io.kestra.plugin.scripts.runner.docker.Docker
     dependencies:
       - kestra
-    inputFiles:
-      branch.json: "{{ outputs.fetch_branch_metadata.body }}"
-      tip-commit.json: "{{ outputs.fetch_tip_commit.body }}"
     env:
       REPOSITORY: "{{ inputs.repository }}"
       BRANCH: "{{ inputs.branch }}"
       REQUIRE_BRANCH_PROTECTION: "{{ inputs.require_branch_protection }}"
       REQUIRE_VERIFIED_TIP_COMMIT: "{{ inputs.require_verified_tip_commit }}"
+      BRANCH_NAME: "{{ outputs.fetch_branch_metadata.body | jq('.name') | first }}"
+      BRANCH_PROTECTED: "{{ outputs.fetch_branch_metadata.body | jq('.protected') | first }}"
+      BRANCH_URL: "{{ outputs.fetch_branch_metadata.body | jq('.url') | first }}"
+      COMMIT_SHA: "{{ outputs.fetch_tip_commit.body | jq('.sha') | first }}"
+      COMMIT_URL: "{{ outputs.fetch_tip_commit.body | jq('.html_url') | first }}"
+      SIGNATURE_VERIFIED: "{{ outputs.fetch_tip_commit.body | jq('.commit.verification.verified') | first }}"
+      VERIFICATION_REASON: "{{ outputs.fetch_tip_commit.body | jq('.commit.verification.reason') | first }}"
     outputFiles:
       - branch-readiness-audit.json
     script: |
@@ -158,23 +162,16 @@ tasks:
       require_protection = os.environ.get("REQUIRE_BRANCH_PROTECTION", "true").lower() == "true"
       require_verified_tip = os.environ.get("REQUIRE_VERIFIED_TIP_COMMIT", "false").lower() == "true"
 
-      with open("branch.json", encoding="utf-8") as source:
-          branch = json.load(source)
-      with open("tip-commit.json", encoding="utf-8") as source:
-          commit = json.load(source)
-
-      if not isinstance(branch, dict) or not branch.get("name") or not isinstance(branch.get("protected"), bool):
-          raise ValueError("GitHub branch API response is missing the expected name/protected fields")
-      if not isinstance(commit, dict) or not isinstance(commit.get("commit"), dict):
-          raise ValueError("GitHub commit API response is missing commit metadata")
-
-      verification = commit["commit"].get("verification") or {}
-      signature_verified = verification.get("verified")
-      verification_reason = verification.get("reason")
-      commit_sha = str(commit.get("sha") or branch.get("commit", {}).get("sha") or "")
-      commit_url = str(commit.get("html_url") or "")
-      commit_subject = str(commit["commit"].get("message") or "").splitlines()[0][:240]
-      protected = bool(branch["protected"])
+      branch_name = os.environ["BRANCH_NAME"].strip()
+      branch_url = os.environ.get("BRANCH_URL", "").strip()
+      branch_protected = os.environ.get("BRANCH_PROTECTED", "").strip().lower() == "true"
+      commit_sha = os.environ.get("COMMIT_SHA", "").strip()
+      commit_url = os.environ.get("COMMIT_URL", "").strip()
+      signature_text = os.environ.get("SIGNATURE_VERIFIED", "").strip().lower()
+      signature_verified = True if signature_text == "true" else (False if signature_text == "false" else None)
+      verification_reason = os.environ.get("VERIFICATION_REASON", "").strip()
+      if verification_reason.lower() in {"", "null"}:
+          verification_reason = None
 
       findings = []
       def add(code, severity, message):
@@ -197,7 +194,7 @@ tasks:
           "checkedAt": datetime.now(timezone.utc).isoformat(),
           "repository": repository,
           "branch": branch_name,
-          "branchUrl": branch.get("url"),
+          "branchUrl": branch_url,
           "branchProtected": protected,
           "requiredBranchProtection": require_protection,
           "tipCommitSha": commit_sha,
