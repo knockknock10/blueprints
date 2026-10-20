@@ -2,9 +2,8 @@ id: git-submodule-integrity-guard
 namespace: company.supplychain
 description: |
   Audit a public GitHub repository's Git submodule configuration before building or promoting a release.
-  The workflow parses .gitmodules, validates submodule URL policy, compares declared submodule paths with
-  GitHub's recursive Git tree, and verifies each checked-out submodule is represented by a full immutable
-  commit SHA. It detects missing gitlinks, undeclared gitlinks, duplicate paths, unsafe URLs, and incomplete
+  The workflow parses .gitmodules, validates submodule URL policy, checks every declared path through
+  GitHub's Contents API, and verifies each configured submodule points to a full immutable commit SHA. It detects missing gitlinks, unverified declared submodule paths, duplicate paths, unsafe URLs, and incomplete
   tree responses. It writes machine-readable evidence and can archive it to S3. This validates superproject
   metadata; it does not clone submodules or audit their own transitive dependencies.
 
@@ -103,20 +102,9 @@ tasks:
       Accept: text/plain
     timeout: PT30S
 
-  - id: fetch_git_tree
-    type: io.kestra.plugin.core.http.Request
-    description: Fetch the recursive Git tree so declared submodule paths can be matched to mode-160000 gitlink entries and commit object IDs.
-    uri: "https://api.github.com/repos/{{ inputs.repository }}/git/trees/{{ inputs.default_branch }}?recursive=1"
-    method: GET
-    headers:
-      Accept: application/vnd.github+json
-      X-GitHub-Api-Version: "2022-11-28"
-      User-Agent: Kestra-Git-Submodule-Integrity-Guard/1.0
-    timeout: PT45S
-
   - id: audit_submodule_pins
     type: io.kestra.plugin.scripts.python.Script
-    description: Parse .gitmodules, check URL scheme and duplicate paths, match every declaration with a Git tree gitlink, and require an immutable 40- or 64-character commit SHA.
+    description: Parse .gitmodules, check URL scheme and duplicate paths, verify each declaration resolves to a GitHub submodule object, and require an immutable 40- or 64-character commit SHA.
     containerImage: python:3.12-slim
     taskRunner:
       type: io.kestra.plugin.scripts.runner.docker.Docker
@@ -124,7 +112,6 @@ tasks:
       - pip install kestra
     inputFiles:
       gitmodules.ini: "{{ outputs.fetch_gitmodules.body }}"
-      git-tree.json: "{{ outputs.fetch_git_tree.body }}"
     env:
       REPOSITORY: "{{ inputs.repository }}"
       DEFAULT_BRANCH: "{{ inputs.default_branch }}"
@@ -139,6 +126,10 @@ tasks:
       import json
       import os
       import re
+      import time
+      import urllib.error
+      import urllib.parse
+      import urllib.request
       from collections import Counter
       from datetime import datetime, timezone
 
@@ -153,12 +144,6 @@ tasks:
 
       with open("gitmodules.ini", encoding="utf-8") as source:
           gitmodules_text = source.read()
-      with open("git-tree.json", encoding="utf-8") as source:
-          tree_response = json.load(source)
-      if not isinstance(tree_response, dict):
-          raise ValueError("GitHub Git Trees API response must be a JSON object")
-      if tree_response.get("message") and not tree_response.get("tree"):
-          raise ValueError(f"GitHub could not return the repository tree: {tree_response.get('message')}")
 
       parser = configparser.ConfigParser(interpolation=None, strict=True)
       try:
@@ -196,33 +181,56 @@ tasks:
           severity = "BLOCK" if reject_duplicates else "WARN"
           add("DUPLICATE_SUBMODULE_PATH", severity, f"Submodule path {path!r} is declared more than once.", path)
 
-      tree = tree_response.get("tree") or []
-      tree_truncated = bool(tree_response.get("truncated", False))
-      if not isinstance(tree, list):
-          raise ValueError("GitHub tree response did not contain a tree array")
+      # Query per path. GitHub's recursive tree endpoint can exceed Kestra's
+      # worker result-message limit on large repositories.
       gitlinks = {}
-      for entry in tree:
-          if not isinstance(entry, dict):
+      missing_gitlinks = []
+      for item in submodules:
+          path = item["path"]
+          encoded_path = urllib.parse.quote(path, safe="/")
+          encoded_ref = urllib.parse.quote(ref, safe="")
+          url = f"https://api.github.com/repos/{repository}/contents/{encoded_path}?ref={encoded_ref}"
+          request = urllib.request.Request(
+              url,
+              headers={
+                  "Accept": "application/vnd.github+json",
+                  "User-Agent": "Kestra-Git-Submodule-Integrity-Guard/1.0",
+              },
+          )
+          try:
+              with urllib.request.urlopen(request, timeout=20) as response:
+                  payload = json.load(response)
+          except urllib.error.HTTPError as exc:
+              missing_gitlinks.append(path)
+              add("SUBMODULE_LOOKUP_FAILED", "BLOCK", f"GitHub Contents API returned HTTP {exc.code} for declared submodule path.", path)
+              time.sleep(0.15)
               continue
-          if entry.get("mode") == "160000" or entry.get("type") == "commit":
-              path = str(entry.get("path") or "")
-              sha = str(entry.get("sha") or "")
-              gitlinks[path] = {"sha": sha, "mode": entry.get("mode"), "type": entry.get("type")}
-              if not re.fullmatch(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})", sha):
-                  add("GITLINK_SHA_INVALID", "BLOCK", f"Gitlink {path!r} has an invalid object ID {sha!r}.", path)
+          except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+              missing_gitlinks.append(path)
+              add("SUBMODULE_LOOKUP_FAILED", "BLOCK", f"Unable to verify declared submodule path through GitHub API: {exc}", path)
+              time.sleep(0.15)
+              continue
 
-      if tree_truncated:
-          add("GIT_TREE_TRUNCATED", "BLOCK", "GitHub marked the recursive tree response as truncated; complete submodule coverage cannot be confirmed.")
-      declared_paths = set(paths)
-      tree_paths = set(gitlinks)
-      missing_gitlinks = sorted(declared_paths - tree_paths)
-      undeclared_gitlinks = sorted(tree_paths - declared_paths)
-      if require_match:
-          for path in missing_gitlinks:
-              add("DECLARED_SUBMODULE_MISSING_GITLINK", "BLOCK", f".gitmodules declares {path!r} but the Git tree has no gitlink at that path.", path)
-          for path in undeclared_gitlinks:
-              add("GITLINK_NOT_DECLARED", "BLOCK", f"Git tree contains submodule gitlink {path!r} but .gitmodules has no matching declaration.", path)
+          if not isinstance(payload, dict) or payload.get("type") != "submodule":
+              missing_gitlinks.append(path)
+              actual_type = payload.get("type") if isinstance(payload, dict) else type(payload).__name__
+              add("DECLARED_SUBMODULE_NOT_GITLINK", "BLOCK", f"Expected a GitHub submodule object at this path, found type {actual_type!r}.", path)
+              time.sleep(0.15)
+              continue
 
+          sha = str(payload.get("sha") or "")
+          if not re.fullmatch(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})", sha):
+              missing_gitlinks.append(path)
+              add("GITLINK_SHA_INVALID", "BLOCK", f"GitHub returned an invalid commit object ID {sha!r}.", path)
+          gitlinks[path] = {
+              "sha": sha,
+              "mode": "160000",
+              "type": "submodule",
+              "url": payload.get("submodule_git_url"),
+          }
+          time.sleep(0.15)
+
+      missing_gitlinks = sorted(set(missing_gitlinks))
       branch_overrides = sorted(item["path"] for item in submodules if item["branchOverride"])
       if branch_overrides:
           add("SUBMODULE_BRANCH_OVERRIDE", "WARN", "Submodule branch overrides were found. The superproject still pins each checked-out gitlink, but branch tracking can surprise update workflows: " + ", ".join(branch_overrides[:50]))
@@ -237,14 +245,12 @@ tasks:
           "ref": ref,
           "gitmodulesPath": gitmodules_path,
           "gitmodulesSections": len(submodules),
-          "gitlinkCount": len(gitlinks),
+          "verifiedSubmoduleCount": len(gitlinks) - len(missing_gitlinks),
           "gitmodulesPaths": paths,
-          "gitlinkPaths": sorted(gitlinks),
-          "missingGitlinks": missing_gitlinks,
-          "undeclaredGitlinks": undeclared_gitlinks,
-          "gitlinkObjectIds": gitlinks,
+          "verifiedSubmodulePaths": sorted(gitlinks),
+          "unverifiedSubmodulePaths": missing_gitlinks,
+          "submoduleObjectIds": gitlinks,
           "branchOverrides": branch_overrides,
-          "treeTruncated": tree_truncated,
           "findings": findings,
           "blockingFindingCount": len(blocking),
           "warningCount": len(warnings),
@@ -254,16 +260,14 @@ tasks:
       with open("git-submodule-audit.json", "w", encoding="utf-8") as target:
           json.dump(report, target, indent=2, ensure_ascii=False)
 
-      print(f"Git submodule integrity audit: {repository}@{ref} verdict={verdict}; declared={len(submodules)}, gitlinks={len(gitlinks)}, blocking={len(blocking)}")
+      print(f"Git submodule integrity audit: {repository}@{ref} verdict={verdict}; declared={len(submodules)}, verified={len(gitlinks) - len(missing_gitlinks)}, unverified={len(missing_gitlinks)}, blocking={len(blocking)}")
       Kestra.outputs({
           "repository": repository,
           "ref": ref,
           "gitmodules_path": gitmodules_path,
           "declared_submodule_count": len(submodules),
-          "gitlink_count": len(gitlinks),
-          "missing_gitlink_count": len(missing_gitlinks),
-          "undeclared_gitlink_count": len(undeclared_gitlinks),
-          "tree_truncated": tree_truncated,
+          "verified_submodule_count": len(gitlinks) - len(missing_gitlinks),
+          "unverified_submodule_count": len(missing_gitlinks),
           "blocking_finding_count": len(blocking),
           "warning_count": len(warnings),
           "findings": findings,
@@ -340,20 +344,20 @@ extend:
   shortDescription: Verify .gitmodules declarations match GitHub tree gitlinks, submodule URLs follow HTTPS policy, and every selected submodule is pinned to a full commit object ID.
   metaDescription: Gate Git submodule usage on valid .gitmodules paths, HTTPS source URLs, matching Git tree entries, and full immutable commit pins before build or release.
   description: |
-    Audit the submodule definitions of a public GitHub repository before building or releasing it. The workflow parses .gitmodules, compares its declared paths with the superproject's recursive Git tree, validates URL policy, and confirms that submodule gitlinks carry full commit object IDs. It reports missing and undeclared gitlinks, duplicate paths and truncated API responses, then supports optional evidence retention and a blocking release path.
+    Audit the submodule definitions of a public GitHub repository before building or releasing it. The workflow parses .gitmodules, compares its declared paths with the superproject's recursive Git tree, validates URL policy, and confirms that submodule gitlinks carry full commit object IDs. It reports missing and unverified declared submodule paths, duplicate paths and truncated API responses, then supports optional evidence retention and a blocking release path.
 
     ## How it works
 
     1. Validate the repository, ref and .gitmodules path.
     2. Fetch the real .gitmodules file and recursive Git tree from the same public GitHub ref.
     3. Parse submodule names, paths, URLs and optional branch overrides.
-    4. Match every declared path with a Git tree gitlink, identify undeclared gitlinks, and verify commit object IDs and URL policy.
+    4. Match every declared path with a Git tree gitlink, identify unverified declared submodule paths, and verify commit object IDs and URL policy.
     5. Optionally archive the JSON report to S3; block downstream work if the repository metadata violates the selected policy.
 
     ## What you get
 
     - A JSON report of submodule declarations and pinned gitlink commit IDs.
-    - Detection of missing or undeclared gitlinks and duplicate paths.
+    - Detection of declared paths that are missing or do not resolve to a submodule object and duplicate paths.
     - Detection of non-HTTPS URLs and invalid commit object IDs.
     - Fail-closed behavior when GitHub returns a truncated tree response.
     - Optional S3 evidence archiving without cloning dependent repositories.
@@ -398,7 +402,7 @@ extend:
     ## Links
 
     - [Git submodule documentation](https://git-scm.com/book/en/v2/Git-Tools-Submodules)
-    - [GitHub Git Trees API](https://docs.github.com/en/rest/git/trees#get-a-tree)
+    - [GitHub Contents API](https://docs.github.com/en/rest/git/trees#get-a-tree)
     - [GitHub raw file access](https://docs.github.com/en/repositories/working-with-files/using-files/getting-permanent-links-to-files)
     - [Kestra HTTP Request plugin](https://kestra.io/plugins/plugin-core/http/io.kestra.plugin.core.http.request)
     - [Kestra Python Script plugin](https://kestra.io/plugins/plugin-scripts/python)
