@@ -1,0 +1,542 @@
+id: robots-sitemap-indexability-policy-gate
+namespace: company.web
+description: |
+  Audit a public website's robots.txt and XML sitemap before search-index release or site
+  migration. The flow validates sitemap directives, XML structure, URL schemes and host
+  consistency, duplicate URL entries, and optional lastmod date formats. For large sitemap
+  indexes it can validate child sitemap references without fetching every document. It emits a
+  JSON report, can notify Slack, and can fail a strict publishing gate.
+
+inputs:
+  - id: base_url
+    type: STRING
+    displayName: Website base URL
+    defaults: https://developer.mozilla.org
+    description: Canonical HTTPS website origin to audit.
+  - id: allowed_hosts
+    type: STRING
+    displayName: Allowed website hosts
+    defaults: developer.mozilla.org
+    description: Comma-separated exact public hostnames accepted for robots.txt, redirects and sitemap URLs.
+  - id: fallback_sitemap_url
+    type: STRING
+    displayName: Fallback sitemap URL
+    defaults: https://developer.mozilla.org/sitemap.xml
+    description: Sitemap used when robots.txt has no Sitemap directive; the gate can still report a missing directive.
+  - id: require_sitemap_directive
+    type: BOOL
+    displayName: Require sitemap directive
+    defaults: true
+    description: Block when robots.txt does not declare at least one Sitemap directive.
+  - id: follow_child_sitemaps
+    type: BOOL
+    displayName: Fetch child sitemap files
+    defaults: false
+    description: When enabled, follow child sitemap URLs from sitemap indexes up to the configured cap; disabled mode validates index references only.
+  - id: maximum_document_bytes
+    type: INT
+    displayName: Maximum document bytes
+    defaults: 5000000
+    description: Maximum download size per robots or XML sitemap document, from 1024 to 10000000 bytes.
+  - id: maximum_sitemaps
+    type: INT
+    displayName: Maximum sitemap documents
+    defaults: 10
+    description: Maximum sitemap documents to fetch in one execution, from 1 to 50.
+  - id: maximum_urls
+    type: INT
+    displayName: Maximum URL entries
+    defaults: 10000
+    description: Maximum URL entries inspected across URL sets, from 1 to 50000.
+  - id: strict_mode
+    type: BOOL
+    displayName: Fail on blocking findings
+    defaults: true
+    description: When enabled, fail if required sitemap metadata or XML/URL policy checks fail.
+  - id: notify_slack
+    type: BOOL
+    displayName: Send Slack alert
+    defaults: false
+    description: Enable only after configuring SLACK_WEBHOOK_URL in the Kestra namespace.
+
+triggers:
+  - id: weekly_indexability_audit
+    type: io.kestra.plugin.core.trigger.Schedule
+    description: Optional weekly robots and sitemap check; disabled until the website and policy are approved.
+    cron: "0 8 * * 1"
+    disabled: true
+
+tasks:
+  - id: validate_request
+    type: io.kestra.plugin.scripts.python.Script
+    description: Validate the website origin, exact host allowlist and document/URL limits before network access.
+    containerImage: python:3.12-slim
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+    env:
+      BASE_URL: "{{ inputs.base_url }}"
+      ALLOWED_HOSTS: "{{ inputs.allowed_hosts }}"
+      FALLBACK_SITEMAP_URL: "{{ inputs.fallback_sitemap_url }}"
+      MAXIMUM_DOCUMENT_BYTES: "{{ inputs.maximum_document_bytes }}"
+      MAXIMUM_SITEMAPS: "{{ inputs.maximum_sitemaps }}"
+      MAXIMUM_URLS: "{{ inputs.maximum_urls }}"
+    script: |
+      import os
+      from urllib.parse import urlsplit
+
+      base = urlsplit(os.environ.get("BASE_URL", "").strip())
+      if base.scheme != "https" or not base.hostname or base.username or base.password:
+          raise ValueError("base_url must be an HTTPS origin without embedded credentials")
+      if base.port not in (None, 443):
+          raise ValueError("base_url must use the default HTTPS port")
+      hosts = [item.strip().lower() for item in os.environ.get("ALLOWED_HOSTS", "").split(",") if item.strip()]
+      if not hosts or base.hostname.lower() not in hosts:
+          raise ValueError("base_url host must exactly match one of allowed_hosts")
+      if any(not item.replace(".", "").replace("-", "").isalnum() for item in hosts):
+          raise ValueError("allowed_hosts must contain plain DNS hostnames")
+      fallback = urlsplit(os.environ.get("FALLBACK_SITEMAP_URL", "").strip())
+      if fallback.scheme != "https" or not fallback.hostname or fallback.hostname.lower() not in hosts:
+          raise ValueError("fallback_sitemap_url must be HTTPS and use an allowed host")
+      bounds = {
+          "maximum_document_bytes": (int(os.environ["MAXIMUM_DOCUMENT_BYTES"]), 1024, 10_000_000),
+          "maximum_sitemaps": (int(os.environ["MAXIMUM_SITEMAPS"]), 1, 50),
+          "maximum_urls": (int(os.environ["MAXIMUM_URLS"]), 1, 50_000),
+      }
+      for name, (value, minimum, maximum) in bounds.items():
+          if not minimum <= value <= maximum:
+              raise ValueError(f"{name} must be between {minimum} and {maximum}")
+      print("Website origin, host allowlist and sitemap audit limits are valid.")
+
+  - id: audit_robots_and_sitemap
+    type: io.kestra.plugin.scripts.python.Script
+    description: Fetch robots.txt and bounded XML sitemap documents, then check site URLs, duplicate entries, XML root shape and lastmod syntax without crawling individual pages.
+    containerImage: python:3.12-slim
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+    dependencies:
+      - kestra
+    env:
+      BASE_URL: "{{ inputs.base_url }}"
+      ALLOWED_HOSTS: "{{ inputs.allowed_hosts }}"
+      FALLBACK_SITEMAP_URL: "{{ inputs.fallback_sitemap_url }}"
+      REQUIRE_SITEMAP_DIRECTIVE: "{{ inputs.require_sitemap_directive }}"
+      FOLLOW_CHILD_SITEMAPS: "{{ inputs.follow_child_sitemaps }}"
+      MAXIMUM_DOCUMENT_BYTES: "{{ inputs.maximum_document_bytes }}"
+      MAXIMUM_SITEMAPS: "{{ inputs.maximum_sitemaps }}"
+      MAXIMUM_URLS: "{{ inputs.maximum_urls }}"
+    outputFiles:
+      - indexability-report.json
+    script: |
+      import gzip
+      import ipaddress
+      import io
+      import json
+      import os
+      import re
+      import socket
+      import urllib.error
+      import urllib.parse
+      import urllib.request
+      import xml.etree.ElementTree as ET
+      from datetime import datetime, timezone
+
+      from kestra import Kestra
+
+      base_url = os.environ["BASE_URL"].strip().rstrip("/")
+      allowed_hosts = {h.strip().lower() for h in os.environ.get("ALLOWED_HOSTS", "").split(",") if h.strip()}
+      fallback_sitemap_url = os.environ["FALLBACK_SITEMAP_URL"].strip()
+      require_sitemap_directive = os.environ.get("REQUIRE_SITEMAP_DIRECTIVE", "true").lower() == "true"
+      follow_child_sitemaps = os.environ.get("FOLLOW_CHILD_SITEMAPS", "false").lower() == "true"
+      maximum_document_bytes = int(os.environ["MAXIMUM_DOCUMENT_BYTES"])
+      maximum_sitemaps = int(os.environ["MAXIMUM_SITEMAPS"])
+      maximum_urls = int(os.environ["MAXIMUM_URLS"])
+
+      findings = []
+      redirect_chain = []
+      document_urls = []
+      sitemap_locations = []
+      inspected_url_samples = []
+      duplicate_urls = []
+      offsite_urls = []
+      insecure_urls = []
+      invalid_lastmod = []
+      robots_status = "not_checked"
+      sitemap_directive_count = 0
+      robots_user_agent_count = 0
+      robots_allow_count = 0
+      robots_disallow_count = 0
+      xml_url_count = 0
+      child_sitemap_count = 0
+      complete_url_scan = True
+
+      def add(code, severity, message):
+          findings.append({"code": code, "severity": severity, "message": message})
+
+      def validate_public_https_url(url):
+          parsed = urllib.parse.urlsplit(url)
+          if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
+              raise ValueError("URL must use HTTPS and contain no embedded credentials")
+          if parsed.port not in (None, 443):
+              raise ValueError("URL used a non-default HTTPS port")
+          hostname = parsed.hostname.lower()
+          if hostname not in allowed_hosts:
+              raise ValueError(f"host '{hostname}' is not in the exact allowed_hosts list")
+          try:
+              addresses = socket.getaddrinfo(hostname, 443, type=socket.SOCK_STREAM)
+          except socket.gaierror as exc:
+              raise ValueError(f"could not resolve allowed host '{hostname}': {exc}") from exc
+          resolved = {entry[4][0] for entry in addresses}
+          if not resolved:
+              raise ValueError(f"host '{hostname}' did not resolve")
+          for address in resolved:
+              ip = ipaddress.ip_address(address.split("%", 1)[0])
+              if not ip.is_global:
+                  raise ValueError(f"host '{hostname}' resolved to a non-public address")
+          return hostname
+
+      class AllowlistedRedirectHandler(urllib.request.HTTPRedirectHandler):
+          def redirect_request(self, req, fp, code, msg, headers, newurl):
+              target = urllib.parse.urljoin(req.full_url, newurl)
+              hostname = validate_public_https_url(target)
+              redirect_chain.append({"from": req.full_url, "to": target, "host": hostname, "status": int(code)})
+              return super().redirect_request(req, fp, code, msg, headers, target)
+
+      def fetch_bytes(url):
+          validate_public_https_url(url)
+          request = urllib.request.Request(
+              url,
+              headers={"User-Agent": "Kestra-Robots-Sitemap-Indexability-Gate/1.0", "Accept": "text/plain, application/xml, text/xml, */*"},
+          )
+          opener = urllib.request.build_opener(AllowlistedRedirectHandler())
+          with opener.open(request, timeout=20) as response:
+              final_url = response.geturl()
+              validate_public_https_url(final_url)
+              declared_length = response.headers.get("Content-Length")
+              if declared_length:
+                  try:
+                      if int(declared_length) > maximum_document_bytes:
+                          raise ValueError(f"document at {url} exceeds maximum_document_bytes ({maximum_document_bytes})")
+                  except ValueError as exc:
+                      if "invalid literal" not in str(exc):
+                          raise
+                      add("CONTENT_LENGTH_INVALID", "WARN", f"Content-Length for {url} was not a valid integer.")
+              payload = response.read(maximum_document_bytes + 1)
+          if len(payload) > maximum_document_bytes:
+              raise ValueError(f"document at {url} exceeded maximum_document_bytes ({maximum_document_bytes})")
+          if payload.startswith(b"\x1f\x8b"):
+              with gzip.GzipFile(fileobj=io.BytesIO(payload)) as stream:
+                  payload = stream.read(maximum_document_bytes + 1)
+              if len(payload) > maximum_document_bytes:
+                  raise ValueError(f"decompressed document at {url} exceeded maximum_document_bytes ({maximum_document_bytes})")
+          return payload, final_url
+
+      def local_tag(tag):
+          return tag.rsplit("}", 1)[-1].lower()
+
+      def valid_lastmod(value):
+          value = (value or "").strip()
+          if not value:
+              return False
+          try:
+              datetime.fromisoformat(value.replace("Z", "+00:00"))
+              return True
+          except ValueError:
+              return False
+
+      def check_sitemap_url(value, kind, source_sitemap):
+          parsed = urllib.parse.urlsplit(value)
+          if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
+              (insecure_urls if parsed.scheme != "https" else offsite_urls).append(value[:500])
+              return False
+          if parsed.hostname.lower() not in allowed_hosts:
+              offsite_urls.append(value[:500])
+              return False
+          if parsed.fragment:
+              add("SITEMAP_URL_HAS_FRAGMENT", "WARN", f"A {kind} URL in {source_sitemap} contains a fragment.")
+          return True
+
+      try:
+          base_parts = urllib.parse.urlsplit(base_url)
+          robots_url = urllib.parse.urlunsplit((base_parts.scheme, base_parts.netloc, "/robots.txt", "", ""))
+          robots_bytes, robots_final_url = fetch_bytes(robots_url)
+          robots_text = robots_bytes.decode("utf-8-sig", "replace")
+          robots_status = "fetched"
+          robots_lines = []
+          sitemap_directives = []
+          for raw_line in robots_text.splitlines():
+              line = raw_line.split("#", 1)[0].strip()
+              if not line or ":" not in line:
+                  continue
+              key, value = line.split(":", 1)
+              key = key.strip().lower()
+              value = value.strip()
+              if key == "user-agent" and value:
+                  robots_user_agent_count += 1
+              elif key == "allow" and value:
+                  robots_allow_count += 1
+              elif key == "disallow" and value:
+                  robots_disallow_count += 1
+              elif key == "sitemap" and value:
+                  sitemap_directives.append(urllib.parse.urljoin(robots_final_url, value))
+              robots_lines.append({"directive": key, "hasValue": bool(value)})
+
+          sitemap_directive_count = len(sitemap_directives)
+          if not sitemap_directives:
+              add("ROBOTS_SITEMAP_DIRECTIVE_MISSING", "BLOCK" if require_sitemap_directive else "WARN", "robots.txt does not declare a Sitemap directive.")
+              sitemap_directives = [fallback_sitemap_url]
+
+          for candidate in sitemap_directives[:maximum_sitemaps]:
+              sitemap_locations.append(candidate)
+          if len(sitemap_directives) > maximum_sitemaps:
+              add("SITEMAP_DIRECTIVE_LIMIT_REACHED", "WARN", f"robots.txt declares {len(sitemap_directives)} sitemap URL(s); only the first {maximum_sitemaps} will be inspected.")
+          queue = list(sitemap_locations)
+          seen_document_urls = set()
+          seen_page_urls = set()
+          fetched_document_count = 0
+
+          while queue and fetched_document_count < maximum_sitemaps:
+              sitemap_url = queue.pop(0)
+              if sitemap_url in seen_document_urls:
+                  duplicate_urls.append(sitemap_url)
+                  continue
+              seen_document_urls.add(sitemap_url)
+              payload, final_sitemap_url = fetch_bytes(sitemap_url)
+              document_urls.append(final_sitemap_url)
+              fetched_document_count += 1
+              try:
+                  root = ET.fromstring(payload)
+              except ET.ParseError as exc:
+                  add("SITEMAP_XML_INVALID", "BLOCK", f"Sitemap {sitemap_url} is not valid XML: {str(exc)[:200]}")
+                  continue
+              root_kind = local_tag(root.tag)
+              if root_kind == "sitemapindex":
+                  child_nodes = [node for node in list(root) if local_tag(node.tag) == "sitemap"]
+                  child_sitemap_count += len(child_nodes)
+                  for child in child_nodes:
+                      loc = next((node.text.strip() for node in list(child) if local_tag(node.tag) == "loc" and node.text), "")
+                      lastmod = next((node.text.strip() for node in list(child) if local_tag(node.tag) == "lastmod" and node.text), "")
+                      if not loc:
+                          add("SITEMAP_INDEX_LOC_MISSING", "BLOCK", f"A child sitemap entry in {sitemap_url} has no loc.")
+                          continue
+                      if not check_sitemap_url(loc, "child sitemap", sitemap_url):
+                          add("CHILD_SITEMAP_URL_INVALID", "BLOCK", f"Child sitemap URL in {sitemap_url} violates the host or HTTPS policy.")
+                      if lastmod and not valid_lastmod(lastmod):
+                          invalid_lastmod.append(loc[:300])
+                      if follow_child_sitemaps and loc not in seen_document_urls:
+                          queue.append(loc)
+                  if not follow_child_sitemaps:
+                      complete_url_scan = False
+              elif root_kind == "urlset":
+                  for url_node in list(root):
+                      if local_tag(url_node.tag) != "url":
+                          continue
+                      loc = next((node.text.strip() for node in list(url_node) if local_tag(node.tag) == "loc" and node.text), "")
+                      lastmod = next((node.text.strip() for node in list(url_node) if local_tag(node.tag) == "lastmod" and node.text), "")
+                      if not loc:
+                          add("SITEMAP_PAGE_LOC_MISSING", "BLOCK", f"A URL entry in {sitemap_url} has no loc.")
+                          continue
+                      if not check_sitemap_url(loc, "page", sitemap_url):
+                          add("SITEMAP_PAGE_URL_INVALID", "BLOCK", f"A URL in {sitemap_url} is not HTTPS or is outside allowed_hosts.")
+                      normalized = urllib.parse.urlunsplit((
+                          urllib.parse.urlsplit(loc).scheme.lower(),
+                          urllib.parse.urlsplit(loc).netloc.lower(),
+                          urllib.parse.urlsplit(loc).path or "/",
+                          urllib.parse.urlsplit(loc).query,
+                          "",
+                      ))
+                      if normalized in seen_page_urls:
+                          duplicate_urls.append(loc[:500])
+                      seen_page_urls.add(normalized)
+                      xml_url_count += 1
+                      if len(inspected_url_samples) < 100:
+                          inspected_url_samples.append(loc[:500])
+                      if lastmod and not valid_lastmod(lastmod):
+                          invalid_lastmod.append(loc[:300])
+                      if xml_url_count >= maximum_urls:
+                          complete_url_scan = False
+                          add("SITEMAP_URL_LIMIT_REACHED", "WARN", f"URL scan reached maximum_urls ({maximum_urls}).")
+                          break
+              else:
+                  add("SITEMAP_ROOT_INVALID", "BLOCK", f"Sitemap {sitemap_url} root element must be urlset or sitemapindex, not {root_kind!r}.")
+          if queue:
+              complete_url_scan = False
+              add("SITEMAP_DOCUMENT_LIMIT_REACHED", "WARN", f"More sitemap documents remain after reaching maximum_sitemaps ({maximum_sitemaps}).")
+          if duplicate_urls:
+              add("DUPLICATE_SITEMAP_ENTRIES", "BLOCK", f"Detected {len(duplicate_urls)} duplicate sitemap document or page URL(s).")
+          if offsite_urls:
+              add("SITEMAP_OFFSITE_URLS", "BLOCK", f"Detected {len(offsite_urls)} sitemap URL(s) outside allowed_hosts.")
+          if insecure_urls:
+              add("SITEMAP_NON_HTTPS_URLS", "BLOCK", f"Detected {len(insecure_urls)} sitemap URL(s) that do not use HTTPS.")
+          if invalid_lastmod:
+              add("SITEMAP_LASTMOD_INVALID", "WARN", f"{len(invalid_lastmod)} entry(s) have a non-ISO lastmod value.")
+      except urllib.error.HTTPError as exc:
+          detail = ""
+          try:
+              detail = exc.read(1000).decode("utf-8", "replace")
+          except Exception:
+              pass
+          add("ROBOTS_OR_SITEMAP_FETCH_FAILED", "BLOCK", f"HTTP {exc.code}: {detail[:300]}")
+      except Exception as exc:
+          add("ROBOTS_SITEMAP_AUDIT_FAILED", "BLOCK", str(exc)[:1000])
+
+      blocking = [item for item in findings if item["severity"] == "BLOCK"]
+      warnings = [item for item in findings if item["severity"] == "WARN"]
+      verdict = "FAIL" if blocking else ("PASS_WITH_WARNINGS" if warnings else "PASS")
+      report = {
+          "schemaVersion": 1,
+          "checkedAt": datetime.now(timezone.utc).isoformat(),
+          "baseUrl": base_url,
+          "robotsStatus": robots_status,
+          "robotsUserAgentDirectiveCount": robots_user_agent_count,
+          "robotsAllowRuleCount": robots_allow_count,
+          "robotsDisallowRuleCount": robots_disallow_count,
+          "robotsSitemapDirectiveCount": sitemap_directive_count,
+          "sitemapDocumentsInspected": document_urls,
+          "sitemapLocations": sitemap_locations,
+          "childSitemapCount": child_sitemap_count,
+          "pageUrlCount": xml_url_count,
+          "pageUrlSamples": inspected_url_samples,
+          "duplicateUrlCount": len(duplicate_urls),
+          "offsiteUrlCount": len(offsite_urls),
+          "nonHttpsUrlCount": len(insecure_urls),
+          "invalidLastmodCount": len(invalid_lastmod),
+          "completeUrlScan": complete_url_scan,
+          "followChildSitemaps": follow_child_sitemaps,
+          "findings": findings,
+          "blockingFindingCount": len(blocking),
+          "warningCount": len(warnings),
+          "verdict": verdict,
+          "scopeNote": "This flow audits robots.txt and XML sitemap structure/indexability metadata; it does not crawl page links, render JavaScript, or determine whether every URL is reachable or indexed by a search engine.",
+      }
+      with open("indexability-report.json", "w", encoding="utf-8") as target:
+          json.dump(report, target, indent=2, ensure_ascii=False)
+      print(f"Robots/sitemap audit: robots={robots_status}, sitemapDocs={fetched_document_count if 'fetched_document_count' in locals() else 0}, urls={xml_url_count}, complete={complete_url_scan}, verdict={verdict}, blocking={len(blocking)}.")
+      Kestra.outputs({
+          "base_url": base_url,
+          "robots_status": robots_status,
+          "robots_sitemap_directive_count": sitemap_directive_count,
+          "sitemap_documents_inspected": document_urls,
+          "child_sitemap_count": child_sitemap_count,
+          "page_url_count": xml_url_count,
+          "complete_url_scan": complete_url_scan,
+          "duplicate_url_count": len(duplicate_urls),
+          "offsite_url_count": len(offsite_urls),
+          "non_https_url_count": len(insecure_urls),
+          "blocking_finding_count": len(blocking),
+          "warning_count": len(warnings),
+          "verdict": verdict,
+          "findings": findings,
+      })
+
+  - id: notify_on_indexability_failure
+    type: io.kestra.plugin.core.flow.If
+    description: Send a Slack alert when required robots or sitemap policy checks fail.
+    condition: "{{ inputs.notify_slack and outputs.audit_robots_and_sitemap.vars.blocking_finding_count > 0 }}"
+    then:
+      - id: send_indexability_alert
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        description: Alert with the website origin and indexed sitemap findings.
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        payload: |-
+          {{
+            {
+              "text": ":warning: Robots/sitemap indexability gate failed\nWebsite: " ~ outputs.audit_robots_and_sitemap.vars.base_url ~
+                "\nFindings: " ~ (outputs.audit_robots_and_sitemap.vars.findings | toJson) ~
+                "\nExecution: " ~ execution.id ~
+                "\nReview indexability-report.json."
+            } | toJson
+          }}
+
+  - id: enforce_indexability_policy
+    type: io.kestra.plugin.core.flow.If
+    description: Fail closed in strict mode when robots/sitemap structure or URL policy violates the configured gate.
+    condition: "{{ inputs.strict_mode and outputs.audit_robots_and_sitemap.vars.blocking_finding_count > 0 }}"
+    then:
+      - id: fail_indexability_gate
+        type: io.kestra.plugin.core.execution.Fail
+        description: Stop site publication when required sitemap metadata or URL integrity checks fail.
+        errorMessage: "Robots/sitemap indexability policy failed. Review indexability-report.json."
+    else:
+      - id: log_indexability_verdict
+        type: io.kestra.plugin.core.log.Log
+        level: INFO
+        message: "Robots/sitemap verdict={{ outputs.audit_robots_and_sitemap.vars.verdict }}; sitemapDocs={{ outputs.audit_robots_and_sitemap.vars.sitemap_documents_inspected | length }}; urls={{ outputs.audit_robots_and_sitemap.vars.page_url_count }}."
+
+outputs:
+  - id: indexability_report
+    type: JSON
+    description: Machine-readable robots rules, sitemap files, URL metadata, coverage mode and findings.
+    value: "{{ outputs.audit_robots_and_sitemap.vars | toJson }}"
+
+extend:
+  title: Robots and Sitemap Indexability Policy Gate
+  metaTitle: Robots and Sitemap Indexability Policy Gate | Kestra
+  shortDescription: Audit robots.txt sitemap directives and XML sitemap URLs for valid structure, host policy, duplicates and lastmod metadata.
+  metaDescription: Gate website releases on robots.txt sitemap declarations, XML sitemap structure, HTTPS URLs, host consistency, duplicates and lastmod format.
+  description: |
+    Validate a public website's crawl policy and sitemap metadata before a site release or migration. The flow reads robots.txt, extracts Sitemap directives, and inspects the referenced XML sitemap or sitemap index. It validates XML root shape, page and child-sitemap URLs, HTTPS and host consistency, duplicate entries, and optional lastmod values. It produces JSON evidence, can alert Slack, and can fail a strict site-publication gate.
+
+    ## How it works
+
+    1. The validation task checks the HTTPS origin, exact host allowlist and resource limits.
+    2. The audit task retrieves robots.txt and parses user-agent, allow/disallow and Sitemap directives.
+    3. It fetches the declared or fallback sitemap, parses urlset or sitemapindex XML, and verifies every inspected location against the host/scheme policy.
+    4. It records duplicate URLs, missing loc elements and lastmod formatting issues. Child sitemap files can optionally be fetched up to a configured limit.
+    5. Optional Slack alerting and strict mode run after the report is written.
+
+    ## What you get
+
+    - A JSON report of robots directives, sitemap references, URL counts and scan coverage.
+    - Detection of missing sitemap directives, invalid XML roots, missing loc values, duplicate entries and off-site or non-HTTPS sitemap URLs.
+    - Optional date-format warnings for lastmod values and a bounded child-sitemap traversal mode.
+    - An optional alert and strict site-publication gate.
+
+    ## Who it's for
+
+    - Web platform teams preparing domain launches or migrations.
+    - Technical SEO teams verifying sitemap publishing policies.
+    - Site reliability and documentation teams maintaining large public documentation websites.
+
+    ## Why orchestrate this with Kestra
+
+    The website policy, source documents, validation result and release decision are recorded together. Explicit scan limits make the workflow suitable for scheduled verification without allowing unbounded sitemap crawling.
+
+    ## Prerequisites
+
+    - A Kestra 2.x worker with Docker enabled for the Python Script runner.
+    - Network access to the website's allowed public HTTPS hosts.
+    - A robots.txt file and either a Sitemap directive or an approved fallback sitemap URL.
+
+    ### Secrets
+
+    - SLACK_WEBHOOK_URL: Slack incoming webhook; required only when notify_slack is enabled.
+
+    ## Quick start
+
+    1. Import this flow and run it against the configured developer.mozilla.org example.
+    2. Review indexability-report.json and the indexability_report output.
+    3. Add exact hostnames to allowed_hosts if the sitemap is served by another approved host.
+    4. Enable follow_child_sitemaps only when a complete but bounded URL scan is required.
+    5. Configure SLACK_WEBHOOK_URL before enabling alerts, then enable the schedule after policy review.
+
+    ## How to extend
+
+    - Compare sitemap URL sets across two Git refs or site deployments to detect unexpected changes.
+    - Add organization-specific rules for mandatory sitemap partitions and lastmod freshness.
+    - Add a separate bounded page crawler after the sitemap metadata audit.
+    - Archive reports and require a passing execution as a release promotion condition.
+
+    ## Links
+
+    - [Robots Exclusion Protocol](https://www.rfc-editor.org/rfc/rfc9309)
+    - [Sitemaps protocol](https://www.sitemaps.org/protocol.html)
+    - [Python XML ElementTree documentation](https://docs.python.org/3/library/xml.etree.elementtree.html)
+    - [Kestra Python Script plugin](https://kestra.io/plugins/plugin-scripts/python)
+    - [Kestra Slack plugin](https://kestra.io/plugins/plugin-slack/slackincomingwebhook)
+  tags:
+    - Infrastructure
+  subTags:
+    - Monitoring & Alerting
+    - Testing & Quality
+  ee: false
+  demo: false
