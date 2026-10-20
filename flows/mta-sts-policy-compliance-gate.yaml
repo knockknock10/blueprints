@@ -1,0 +1,463 @@
+id: mta-sts-policy-compliance-gate
+namespace: company.security
+description: |
+  Audit a domain's MTA-STS DNS advertisement and HTTPS policy. The flow checks the _mta-sts TXT
+  version and policy identifier, fetches the well-known MTA-STS policy over HTTPS, parses mode,
+  max_age and MX patterns, and compares those patterns with the domain's published MX records.
+  It emits JSON evidence and can alert when policy metadata is missing or inconsistent.
+
+inputs:
+  - id: domain
+    type: STRING
+    displayName: Mail domain
+    defaults: google.com
+    description: Domain receiving email, without a URL scheme or path.
+  - id: minimum_max_age_seconds
+    type: INT
+    displayName: Minimum MTA-STS max_age
+    defaults: 86400
+    description: Block when the published HTTPS policy max_age is lower than this number of seconds.
+  - id: require_enforce_mode
+    type: BOOL
+    displayName: Require enforce mode
+    defaults: false
+    description: Block unless the policy mode is enforce. When false, testing or none mode is reported as a warning.
+  - id: require_dns_advertisement
+    type: BOOL
+    displayName: Require DNS TXT advertisement
+    defaults: true
+    description: Require one valid _mta-sts TXT record with a non-empty id.
+  - id: require_all_mx_covered
+    type: BOOL
+    displayName: Require policy coverage for every MX host
+    defaults: true
+    description: Block if a published MX hostname does not match any policy mx pattern.
+  - id: archive_report
+    type: BOOL
+    displayName: Archive report to S3
+    defaults: false
+    description: Store the JSON policy report in S3. AWS credentials are required only when enabled.
+  - id: evidence_bucket
+    type: STRING
+    displayName: S3 evidence bucket
+    defaults: my-mta-sts-evidence
+    description: Existing S3 bucket for optional report retention.
+  - id: evidence_prefix
+    type: STRING
+    displayName: S3 evidence prefix
+    defaults: mta-sts-policy-audits
+    description: Object key prefix for MTA-STS evidence.
+  - id: aws_region
+    type: STRING
+    displayName: AWS region
+    defaults: eu-west-1
+    description: Region containing the evidence bucket.
+
+triggers:
+  - id: weekly_mta_sts_policy_audit
+    type: io.kestra.plugin.core.trigger.Schedule
+    description: Recheck DNS and HTTPS MTA-STS policy weekly. Enable only after reviewing the mail domain's operational policy.
+    cron: "0 7 * * 1"
+    disabled: true
+
+tasks:
+  - id: validate_mail_domain
+    type: io.kestra.plugin.scripts.python.Script
+    description: Validate the domain and policy thresholds before public DNS and HTTPS checks.
+    containerImage: python:3.12-slim
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+    env:
+      DOMAIN: "{{ inputs.domain }}"
+      MINIMUM_MAX_AGE: "{{ inputs.minimum_max_age_seconds }}"
+    script: |
+      import os
+      import re
+
+      domain = os.environ.get("DOMAIN", "").strip().lower().rstrip(".")
+      if not re.fullmatch(r"(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}", domain):
+          raise ValueError("domain must be a DNS name without a URL scheme, path or port")
+      max_age = int(os.environ.get("MINIMUM_MAX_AGE", "86400"))
+      if max_age < 0 or max_age > 31536000:
+          raise ValueError("minimum_max_age_seconds must be between 0 and 31536000")
+      print(f"Validated MTA-STS target {domain}; minimum max_age={max_age} seconds.")
+
+  - id: audit_mta_sts_dns_and_https_policy
+    type: io.kestra.plugin.scripts.python.Script
+    description: Query DNS TXT and MX records, fetch the well-known HTTPS policy with same-host redirects, parse its policy fields, and compare MX coverage.
+    containerImage: python:3.12-slim
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+    dependencies:
+      - dnspython
+      - kestra
+    env:
+      DOMAIN: "{{ inputs.domain }}"
+      MINIMUM_MAX_AGE: "{{ inputs.minimum_max_age_seconds }}"
+      REQUIRE_ENFORCE_MODE: "{{ inputs.require_enforce_mode }}"
+      REQUIRE_DNS_ADVERTISEMENT: "{{ inputs.require_dns_advertisement }}"
+      REQUIRE_ALL_MX_COVERED: "{{ inputs.require_all_mx_covered }}"
+    outputFiles:
+      - mta-sts-policy-audit.json
+    script: |
+      import fnmatch
+      import ipaddress
+      import json
+      import os
+      import socket
+      import urllib.error
+      import urllib.parse
+      import urllib.request
+      from datetime import datetime, timezone
+
+      import dns.exception
+      import dns.resolver
+      from kestra import Kestra
+
+      domain = os.environ["DOMAIN"].strip().lower().rstrip(".")
+      minimum_max_age = int(os.environ.get("MINIMUM_MAX_AGE", "86400"))
+      require_enforce = os.environ.get("REQUIRE_ENFORCE_MODE", "false").lower() == "true"
+      require_dns = os.environ.get("REQUIRE_DNS_ADVERTISEMENT", "true").lower() == "true"
+      require_all_mx = os.environ.get("REQUIRE_ALL_MX_COVERED", "true").lower() == "true"
+      policy_host = f"mta-sts.{domain}"
+      now = datetime.now(timezone.utc)
+
+      resolver = dns.resolver.Resolver()
+      resolver.timeout = 3
+      resolver.lifetime = 8
+
+      def resolve_records(name, record_type):
+          try:
+              answer = resolver.resolve(name, record_type, raise_on_no_answer=False)
+              return list(answer) if answer.rrset else []
+          except (dns.resolver.NXDOMAIN, dns.resolver.NoAnswer):
+              return []
+          except (dns.resolver.NoNameservers, dns.exception.Timeout) as exc:
+              raise RuntimeError(f"DNS {record_type} lookup failed for {name}: {type(exc).__name__}") from exc
+
+      def txt_text(record):
+          return b"".join(record.strings).decode("utf-8", errors="replace").strip()
+
+      def ensure_public_dns(host):
+          if not host:
+              raise ValueError("empty hostname")
+          addresses = {answer[4][0] for answer in socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)}
+          if not addresses:
+              raise ValueError(f"{host} resolved to no addresses")
+          for address in addresses:
+              ip = ipaddress.ip_address(address.split("%", 1)[0])
+              if not ip.is_global:
+                  raise ValueError(f"refusing non-public DNS address {address}")
+
+      class SameHostHTTPSRedirectHandler(urllib.request.HTTPRedirectHandler):
+          def redirect_request(self, req, fp, code, msg, headers, newurl):
+              parsed = urllib.parse.urlparse(newurl)
+              if (
+                  parsed.scheme.lower() != "https"
+                  or parsed.hostname is None
+                  or parsed.hostname.lower() != policy_host
+                  or parsed.port not in (None, 443)
+              ):
+                  raise urllib.error.URLError("redirect left the original MTA-STS HTTPS host or port")
+              ensure_public_dns(parsed.hostname)
+              return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+      dns_txt_records = [
+          txt_text(record)
+          for record in resolve_records(f"_mta-sts.{domain}", "TXT")
+      ]
+      valid_txt_records = []
+      for value in dns_txt_records:
+          parts = [part.strip() for part in value.split(";") if part.strip()]
+          tags = {}
+          for part in parts:
+              if "=" in part:
+                  key, item = part.split("=", 1)
+                  tags[key.strip().lower()] = item.strip()
+          if tags.get("v", "").upper() == "STSV1" and tags.get("id"):
+              valid_txt_records.append({"raw": value, "id": tags["id"]})
+
+      mx_records = sorted({
+          str(record.exchange).rstrip(".").lower()
+          for record in resolve_records(domain, "MX")
+      })
+      findings = []
+      def add(code, severity, message):
+          findings.append({"code": code, "severity": severity, "message": message})
+
+      if require_dns and len(valid_txt_records) != 1:
+          add("MTA_STS_DNS_RECORD_INVALID", "BLOCK", f"Expected exactly one valid v=STSv1 TXT record with an id; found {len(valid_txt_records)}.")
+      elif len(valid_txt_records) > 1:
+          add("MTA_STS_DNS_RECORD_DUPLICATED", "BLOCK", "More than one valid MTA-STS DNS TXT advertisement was found.")
+      if not mx_records:
+          add("MX_RECORDS_MISSING", "BLOCK", f"No MX records were found for {domain}.")
+
+      policy_text = None
+      final_url = None
+      http_status = None
+      content_type = ""
+      if valid_txt_records:
+          ensure_public_dns(policy_host)
+          url = f"https://{policy_host}/.well-known/mta-sts.txt"
+          request = urllib.request.Request(
+              url,
+              headers={"Accept": "text/plain", "User-Agent": "Kestra-MTA-STS-Policy-Audit/1.0"},
+              method="GET",
+          )
+          opener = urllib.request.build_opener(SameHostHTTPSRedirectHandler())
+          try:
+              response = opener.open(request, timeout=15)
+          except urllib.error.HTTPError as exc:
+              response = exc
+          except urllib.error.URLError as exc:
+              raise RuntimeError(f"MTA-STS HTTPS policy request failed: {exc.reason}") from exc
+          try:
+              final_url = response.geturl()
+              final = urllib.parse.urlparse(final_url)
+              if final.scheme.lower() != "https" or final.hostname is None or final.hostname.lower() != policy_host:
+                  raise ValueError("final MTA-STS policy URL is not HTTPS on the expected host")
+              http_status = int(response.code)
+              content_type = response.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
+              body = response.read(16385)
+              if len(body) > 16384:
+                  raise ValueError("MTA-STS policy exceeds the 16 KiB safety limit")
+              policy_text = body.decode("utf-8-sig", errors="replace")
+          finally:
+              response.close()
+          if http_status != 200:
+              add("MTA_STS_POLICY_HTTP_STATUS", "BLOCK", f"HTTPS policy endpoint returned HTTP {http_status}.")
+          if content_type not in {"text/plain", "application/octet-stream"}:
+              add("MTA_STS_POLICY_CONTENT_TYPE", "WARN", f"Expected text/plain policy content, received {content_type or 'no Content-Type'}.")
+
+      policy_fields = {}
+      if policy_text is not None and http_status == 200:
+          for number, raw_line in enumerate(policy_text.splitlines(), start=1):
+              line = raw_line.strip()
+              if not line or line.startswith("#"):
+                  continue
+              if ":" not in line:
+                  add("POLICY_LINE_MALFORMED", "WARN", f"Policy line {number} has no colon.")
+                  continue
+              key, value = line.split(":", 1)
+              key = key.strip().lower()
+              value = value.strip()
+              if key in policy_fields and key != "mx":
+                  add("POLICY_FIELD_DUPLICATED", "BLOCK", f"Policy field {key} is repeated.")
+              if key == "mx":
+                  policy_fields.setdefault(key, []).append(value.lower().rstrip("."))
+              else:
+                  policy_fields[key] = value
+
+          if policy_fields.get("version", "").upper() != "STSV1":
+              add("POLICY_VERSION_INVALID", "BLOCK", "HTTPS MTA-STS policy must contain version: STSv1.")
+          mode = policy_fields.get("mode", "").lower()
+          if mode not in {"enforce", "testing", "none"}:
+              add("POLICY_MODE_INVALID", "BLOCK", "MTA-STS policy mode must be enforce, testing or none.")
+          elif mode != "enforce":
+              severity = "BLOCK" if require_enforce else "WARN"
+              add("POLICY_NOT_ENFORCE", severity, f"MTA-STS policy mode is {mode}, not enforce.")
+          try:
+              max_age = int(policy_fields.get("max_age", ""))
+              if max_age <= 0:
+                  raise ValueError
+              if max_age < minimum_max_age:
+                  add("POLICY_MAX_AGE_TOO_SHORT", "BLOCK", f"MTA-STS max_age {max_age} is below minimum {minimum_max_age}.")
+          except ValueError:
+              max_age = None
+              add("POLICY_MAX_AGE_INVALID", "BLOCK", "MTA-STS max_age must be a positive integer.")
+          patterns = policy_fields.get("mx", [])
+          if not patterns:
+              add("POLICY_MX_MISSING", "BLOCK", "MTA-STS HTTPS policy contains no mx patterns.")
+          uncovered = sorted(
+              mx for mx in mx_records
+              if not any(fnmatch.fnmatchcase(mx, pattern) for pattern in patterns)
+          )
+          if require_all_mx and uncovered:
+              add("MX_NOT_COVERED_BY_POLICY", "BLOCK", "MX host(s) are not matched by any MTA-STS mx pattern: " + ", ".join(uncovered))
+      else:
+          mode, max_age, patterns, uncovered = "", None, [], mx_records
+
+      blocking = [item for item in findings if item["severity"] == "BLOCK"]
+      warnings = [item for item in findings if item["severity"] == "WARN"]
+      verdict = "FAIL" if blocking else ("PASS_WITH_WARNINGS" if warnings else "PASS")
+      report = {
+          "schemaVersion": 1,
+          "checkedAt": now.isoformat(),
+          "domain": domain,
+          "dnsTxtRecords": dns_txt_records,
+          "validDnsAdvertisements": valid_txt_records,
+          "mxRecords": mx_records,
+          "policyHost": policy_host,
+          "policyUrl": final_url,
+          "httpStatus": http_status,
+          "contentType": content_type,
+          "policyText": policy_text,
+          "policyFields": policy_fields,
+          "mode": mode,
+          "maxAgeSeconds": max_age,
+          "mxPatterns": patterns,
+          "uncoveredMxHosts": uncovered,
+          "minimumMaxAgeSeconds": minimum_max_age,
+          "requireEnforceMode": require_enforce,
+          "requireDnsAdvertisement": require_dns,
+          "requireAllMxCovered": require_all_mx,
+          "findings": findings,
+          "blockingFindingCount": len(blocking),
+          "warningCount": len(warnings),
+          "verdict": verdict,
+          "scopeNote": "This audits DNS advertisement and the public HTTPS MTA-STS policy. It does not send mail, prove recipient MTAs enforce the policy, or validate TLS-RPT report delivery.",
+      }
+      with open("mta-sts-policy-audit.json", "w", encoding="utf-8") as target:
+          json.dump(report, target, indent=2, ensure_ascii=False)
+
+      print(f"MTA-STS policy audit: {domain} verdict={verdict}; mode={mode or 'missing'}, max_age={max_age}, DNS advertisements={len(valid_txt_records)}, MX hosts={len(mx_records)}, blocking={len(blocking)}, warnings={len(warnings)}")
+      Kestra.outputs({
+          "domain": domain,
+          "policy_host": policy_host,
+          "dns_advertisement_count": len(valid_txt_records),
+          "http_status": http_status if http_status is not None else 0,
+          "mode": mode,
+          "max_age_seconds": max_age if max_age is not None else 0,
+          "mx_count": len(mx_records),
+          "uncovered_mx_hosts": uncovered,
+          "blocking_finding_count": len(blocking),
+          "warning_count": len(warnings),
+          "verdict": verdict,
+          "findings": findings,
+      })
+
+  - id: optionally_archive_report
+    type: io.kestra.plugin.core.flow.If
+    description: Optionally archive DNS and HTTPS MTA-STS evidence to S3.
+    condition: "{{ inputs.archive_report }}"
+    then:
+      - id: upload_mta_sts_report
+        type: io.kestra.plugin.aws.s3.Upload
+        description: Store MTA-STS policy evidence under an execution-specific object key.
+        accessKeyId: "{{ secret('AWS_ACCESS_KEY_ID') }}"
+        secretKeyId: "{{ secret('AWS_SECRET_ACCESS_KEY') }}"
+        region: "{{ inputs.aws_region }}"
+        bucket: "{{ inputs.evidence_bucket }}"
+        from: "{{ outputs.audit_mta_sts_dns_and_https_policy.outputFiles['mta-sts-policy-audit.json'] }}"
+        key: "{{ inputs.evidence_prefix }}/{{ execution.id }}/mta-sts-policy-audit.json"
+
+  - id: enforce_mta_sts_policy
+    type: io.kestra.plugin.core.flow.If
+    description: Fail when DNS advertisement, HTTPS policy syntax, max_age or MX coverage violates the configured policy.
+    condition: "{{ outputs.audit_mta_sts_dns_and_https_policy.vars.verdict == 'FAIL' }}"
+    then:
+      - id: alert_mta_sts_policy_failure
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        description: Alert the mail or security team when MTA-STS policy validation fails.
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        payload: |-
+          {{
+            {
+              "text": ":rotating_light: MTA-STS policy failed\\nDomain: " ~ outputs.audit_mta_sts_dns_and_https_policy.vars.domain ~
+                "\\nPolicy host: " ~ outputs.audit_mta_sts_dns_and_https_policy.vars.policy_host ~
+                "\\nMode: " ~ outputs.audit_mta_sts_dns_and_https_policy.vars.mode ~
+                "\\nFindings: " ~ (outputs.audit_mta_sts_dns_and_https_policy.vars.findings | toJson) ~
+                "\\nExecution: " ~ execution.id ~
+                "\\nReview mta-sts-policy-audit.json."
+            } | toJson
+          }}
+      - id: fail_mta_sts_policy_gate
+        type: io.kestra.plugin.core.execution.Fail
+        description: Stop downstream email-security onboarding steps when the configured MTA-STS policy fails.
+        errorMessage: "MTA-STS policy failed for {{ outputs.audit_mta_sts_dns_and_https_policy.vars.domain }}. Review mta-sts-policy-audit.json."
+    else:
+      - id: log_mta_sts_verdict
+        type: io.kestra.plugin.core.log.Log
+        level: INFO
+        message: "MTA-STS policy {{ outputs.audit_mta_sts_dns_and_https_policy.vars.verdict }} for {{ outputs.audit_mta_sts_dns_and_https_policy.vars.domain }}; mode={{ outputs.audit_mta_sts_dns_and_https_policy.vars.mode }}, max_age={{ outputs.audit_mta_sts_dns_and_https_policy.vars.max_age_seconds }}."
+
+errors:
+  - id: alert_mta_sts_execution_failure
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    description: Alert when DNS, HTTPS or policy parsing fails. A technical failure must never be treated as a compliant MTA-STS policy.
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    payload: |-
+      {{
+        {
+          "text": ":warning: MTA-STS audit execution failed\\nDomain: " ~ inputs.domain ~
+            "\\nExecution: " ~ execution.id ~
+            "\\nInspect task logs; do not interpret this failure as a compliant policy."
+        } | toJson
+      }}
+
+extend:
+  title: MTA-STS HTTPS Policy Compliance Gate
+  metaTitle: MTA-STS HTTPS Policy Compliance Gate | Kestra
+  shortDescription: Check DNS advertisement, HTTPS policy validity, max_age and MX coverage for a domain's MTA-STS configuration.
+  metaDescription: Validate MTA-STS DNS advertisement and HTTPS policy, check enforce mode and max_age, and verify every MX host is covered by a policy pattern.
+  description: |
+    Audit a domain's SMTP MTA Strict Transport Security configuration before an email-security review. The flow checks the _mta-sts DNS TXT advertisement, fetches the HTTPS policy from the well-known path, validates version, mode and max_age, and compares the policy's MX patterns to real DNS MX hosts. It produces structured JSON evidence, alerts Slack when policy fails, and optionally archives the report in S3.
+
+    ## How it works
+
+    1. The validation task checks the mail domain and minimum max_age threshold.
+    2. The audit task queries the domain's _mta-sts TXT record and its MX records.
+    3. If a valid version and id advertisement exists, the flow fetches the policy from the mta-sts subdomain over HTTPS and follows only same-host HTTPS redirects.
+    4. The parser validates version, mode, max_age and mx fields, then checks whether all observed MX hosts match the policy patterns.
+    5. The JSON report includes DNS evidence, policy body, findings and verdict. An optional S3 branch archives it, and a policy If alerts and fails for blocking findings.
+
+    ## What you get
+
+    - A report correlating the DNS advertisement, HTTPS policy and live MX records.
+    - Fail-closed handling for missing DNS advertisement, invalid policy data, weak max_age and uncovered mail exchangers.
+    - Configurable enforcement checks for require-enforce mode and complete MX coverage.
+    - Optional Slack alerting and S3 evidence retention.
+
+    ## Who it's for
+
+    - Email security teams maintaining MTA-STS deployment for public mail domains.
+    - Platform engineers onboarding or changing mail hosting providers.
+    - Compliance and SRE teams who want a repeatable record of transport-policy changes.
+
+    ## Why orchestrate this with Kestra
+
+    Kestra makes the requirements explicit, tracks each DNS and HTTPS assessment as an execution, schedules rechecks and routes policy failures to an alert plus a failing task that downstream onboarding can depend on.
+
+    ## Prerequisites
+
+    - A Kestra 2.x worker with Docker enabled for Python Script tasks.
+    - Network access to public DNS resolvers and the public HTTPS MTA-STS policy host.
+    - A Slack incoming webhook for policy-failure and execution-error alerts.
+    - An S3 bucket and write-capable AWS credentials only when optional report archival is enabled.
+
+    ### Secrets
+
+    - SLACK_WEBHOOK_URL: Slack incoming webhook for MTA-STS policy failures and execution errors.
+    - AWS_ACCESS_KEY_ID: optional AWS access key used only when S3 archival is enabled.
+    - AWS_SECRET_ACCESS_KEY: optional AWS secret key used only when S3 archival is enabled.
+
+    ## Quick start
+
+    1. Import the flow with domain=google.com and run it manually.
+    2. Inspect mta-sts-policy-audit.json, especially the DNS advertisement id, HTTPS policy host, mode, max_age and MX coverage.
+    3. Set require_enforce_mode=true only after confirming that the domain's mail infrastructure is ready for enforcement.
+    4. Tune minimum_max_age_seconds and require_all_mx_covered to fit the domain's operational policy.
+    5. Configure SLACK_WEBHOOK_URL before relying on blocking alerts and enable the weekly schedule after reviewing initial evidence.
+
+    ## How to extend
+
+    - Check TLS-RPT DNS TXT records and send delivery tests to confirm report collection.
+    - Compare the advertised DNS id against a change-controlled policy release process.
+    - Validate each MX host's TLS handshake and certificate chain from independent external runners.
+    - Route the report to a security dashboard or onboarding approval workflow.
+
+    ## Links
+
+    - [RFC 8461: SMTP MTA Strict Transport Security](https://www.rfc-editor.org/rfc/rfc8461)
+    - [RFC 8460: SMTP TLS Reporting](https://www.rfc-editor.org/rfc/rfc8460)
+    - [dnspython documentation](https://dnspython.readthedocs.io/en/stable/)
+    - [Kestra Python Script plugin](https://kestra.io/plugins/plugin-scripts/python)
+    - [Kestra Slack plugin](https://kestra.io/plugins/plugin-slack/slackincomingwebhook)
+    - [Kestra AWS S3 plugin](https://kestra.io/plugins/plugin-aws/s3)
+  tags:
+    - Infrastructure
+  subTags:
+    - Policy & Compliance
+    - Monitoring & Alerting
+  ee: false
+  demo: false
