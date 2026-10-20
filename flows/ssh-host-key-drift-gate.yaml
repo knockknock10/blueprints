@@ -1,0 +1,346 @@
+id: ssh-host-key-drift-gate
+namespace: company.security
+description: |
+  Periodically compare a server's live SSH host-key fingerprints against pins obtained from an
+  independent trusted source. The default pins are GitHub's published RSA, ECDSA and Ed25519
+  fingerprints; change the host and pins together for another service. The gate reports the
+  observed algorithms and fingerprints, alerts on unexpected keys, and fails closed on drift.
+
+inputs:
+  - id: host
+    type: STRING
+    displayName: SSH host
+    defaults: github.com
+    description: DNS hostname or IPv4 address to scan. Enter a hostname only, without a scheme, path, or port.
+  - id: port
+    type: INT
+    displayName: SSH port
+    defaults: 22
+    description: TCP port serving SSH.
+  - id: key_types
+    type: STRING
+    displayName: SSH key algorithms to scan
+    defaults: ed25519,ecdsa,rsa
+    description: Comma-separated ssh-keyscan algorithms selected from ed25519, ecdsa, and rsa.
+  - id: expected_fingerprints
+    type: STRING
+    displayName: Trusted SHA-256 fingerprints
+    defaults: SHA256:uNiVztksCsDhcc0u9e8BujQXVUpKZIDTMczCvj3tD2s,SHA256:p2QAMXNIC1TJYWeIOttrVc98/R1BUFWu3/LiyKgUfQM,SHA256:+DiY3wvvV6TuJJhbpZisF/zLDA0zPMSvHdkr4UvCOqU
+    description: Comma-separated SHA256 fingerprints copied from an independent trusted source, not fetched from the host being checked.
+  - id: connect_timeout_seconds
+    type: INT
+    displayName: SSH scan timeout
+    defaults: 8
+    description: Per-key connection timeout in seconds.
+  - id: report_missing_pins
+    type: BOOL
+    displayName: Warn about missing pinned algorithms
+    defaults: true
+    description: Report expected fingerprints not observed as warnings. New or unexpected fingerprints remain blocking.
+
+triggers:
+  - id: daily_host_key_audit
+    type: io.kestra.plugin.core.trigger.Schedule
+    description: Recheck trusted host keys daily. Keep disabled until the pinned fingerprints have been reviewed for the target server.
+    cron: "0 7 * * *"
+    disabled: true
+
+tasks:
+  - id: validate_scan_policy
+    type: io.kestra.plugin.scripts.python.Script
+    description: Validate host, port, key algorithms, trusted fingerprint syntax and scan timeout before connecting.
+    containerImage: python:3.12-slim
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+    env:
+      SSH_HOST: "{{ inputs.host }}"
+      SSH_PORT: "{{ inputs.port }}"
+      SSH_KEY_TYPES: "{{ inputs.key_types }}"
+      EXPECTED_FINGERPRINTS: "{{ inputs.expected_fingerprints }}"
+      CONNECT_TIMEOUT_SECONDS: "{{ inputs.connect_timeout_seconds }}"
+    script: |
+      import os
+      import re
+
+      host = os.environ.get("SSH_HOST", "").strip()
+      if not re.fullmatch(r"[A-Za-z0-9.-]+", host) or host.startswith("-") or ".." in host:
+          raise ValueError("host must be a DNS hostname or IPv4 address without a scheme, path, or port")
+      port = int(os.environ["SSH_PORT"])
+      if not 1 <= port <= 65535:
+          raise ValueError("port must be between 1 and 65535")
+      timeout = int(os.environ["CONNECT_TIMEOUT_SECONDS"])
+      if not 1 <= timeout <= 30:
+          raise ValueError("connect_timeout_seconds must be between 1 and 30")
+      key_types = [item.strip().lower() for item in os.environ["SSH_KEY_TYPES"].split(",") if item.strip()]
+      supported = {"ed25519", "ecdsa", "rsa"}
+      if not key_types or len(set(key_types)) != len(key_types) or set(key_types) - supported:
+          raise ValueError("key_types must be a unique comma-separated subset of ed25519,ecdsa,rsa")
+      fingerprints = [item.strip() for item in os.environ["EXPECTED_FINGERPRINTS"].split(",") if item.strip()]
+      if not fingerprints or any(not re.fullmatch(r"SHA256:[A-Za-z0-9+/]{43}", item) for item in fingerprints):
+          raise ValueError("expected_fingerprints must contain comma-separated SHA256 fingerprints")
+      if len(fingerprints) != len(set(fingerprints)):
+          raise ValueError("expected_fingerprints contains duplicate pins")
+
+      print(f"Validated SSH trust policy for {host}:{port}; {len(key_types)} algorithms requested and {len(fingerprints)} trusted pins configured.")
+
+  - id: scan_and_compare_host_keys
+    type: io.kestra.plugin.scripts.python.Script
+    description: Collect live public host keys with ssh-keyscan, compute SHA-256 fingerprints locally, and compare them with the separately configured trusted pins. ssh-keyscan output alone is not treated as trusted.
+    containerImage: python:3.12-slim
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+    env:
+      SSH_HOST: "{{ inputs.host }}"
+      SSH_PORT: "{{ inputs.port }}"
+      SSH_KEY_TYPES: "{{ inputs.key_types }}"
+      EXPECTED_FINGERPRINTS: "{{ inputs.expected_fingerprints }}"
+      CONNECT_TIMEOUT_SECONDS: "{{ inputs.connect_timeout_seconds }}"
+      REPORT_MISSING_PINS: "{{ inputs.report_missing_pins }}"
+    outputFiles:
+      - host-key-audit.json
+    dependencies:
+      - kestra
+    script: |
+      import json
+      import os
+      import re
+      import shutil
+      import subprocess
+      import tempfile
+      from datetime import datetime, timezone
+
+      from kestra import Kestra
+
+      host = os.environ["SSH_HOST"].strip()
+      port = int(os.environ["SSH_PORT"])
+      timeout = int(os.environ["CONNECT_TIMEOUT_SECONDS"])
+      key_types = [item.strip().lower() for item in os.environ["SSH_KEY_TYPES"].split(",") if item.strip()]
+      expected = sorted({item.strip() for item in os.environ["EXPECTED_FINGERPRINTS"].split(",") if item.strip()})
+      report_missing_pins = os.environ.get("REPORT_MISSING_PINS", "true").lower() == "true"
+
+      if not shutil.which("ssh-keyscan") or not shutil.which("ssh-keygen"):
+          subprocess.run(
+              ["sh", "-lc", "apt-get update -qq && apt-get install -y -qq openssh-client"],
+              check=True,
+              timeout=180,
+          )
+      if not shutil.which("ssh-keyscan") or not shutil.which("ssh-keygen"):
+          raise RuntimeError("openssh-client installation did not provide ssh-keyscan and ssh-keygen")
+
+      scan = subprocess.run(
+          ["ssh-keyscan", "-T", str(timeout), "-p", str(port), "-t", ",".join(key_types), host],
+          capture_output=True,
+          text=True,
+          timeout=timeout * len(key_types) + 15,
+          check=False,
+      )
+      known_hosts_lines = [
+          line for line in scan.stdout.splitlines()
+          if line.strip() and not line.lstrip().startswith("#")
+      ]
+
+      findings = []
+      def add(code, severity, message):
+          findings.append({"code": code, "severity": severity, "message": message})
+
+      observed = []
+      if known_hosts_lines:
+          with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", delete=False) as handle:
+              handle.write("\n".join(known_hosts_lines) + "\n")
+              known_hosts_path = handle.name
+          try:
+              result = subprocess.run(
+                  ["ssh-keygen", "-lf", known_hosts_path, "-E", "sha256"],
+                  capture_output=True,
+                  text=True,
+                  timeout=20,
+                  check=False,
+              )
+              if result.returncode != 0:
+                  raise RuntimeError("ssh-keygen could not fingerprint scanned SSH keys: " + result.stderr[-2000:])
+              for line in result.stdout.splitlines():
+                  parts = line.split()
+                  if len(parts) < 4 or not re.fullmatch(r"SHA256:[A-Za-z0-9+/]{43}", parts[1]):
+                      add("FINGERPRINT_PARSE_FAILED", "BLOCK", "Could not parse one scanned host-key fingerprint.")
+                      continue
+                  algorithm = parts[-1].strip("()").lower()
+                  observed.append({"algorithm": algorithm, "fingerprint": parts[1]})
+          finally:
+              os.unlink(known_hosts_path)
+
+      observed = sorted(
+          { (item["algorithm"], item["fingerprint"]): item for item in observed }.values(),
+          key=lambda item: (item["algorithm"], item["fingerprint"]),
+      )
+      observed_fingerprints = sorted({item["fingerprint"] for item in observed})
+      expected_set = set(expected)
+      observed_set = set(observed_fingerprints)
+      matching = sorted(expected_set & observed_set)
+      unexpected = sorted(observed_set - expected_set)
+      missing = sorted(expected_set - observed_set)
+
+      if not observed:
+          add("NO_HOST_KEYS_OBSERVED", "BLOCK", f"No SSH host keys were collected from {host}:{port}; scan exit code was {scan.returncode}.")
+      if unexpected:
+          add("UNEXPECTED_HOST_KEY", "BLOCK", "Observed host-key fingerprint(s) are not in the independent trust pins: " + ", ".join(unexpected))
+      if observed and not matching:
+          add("NO_TRUSTED_KEY_MATCH", "BLOCK", "None of the live host-key fingerprints matched any configured trust pin.")
+      if missing and report_missing_pins:
+          add("PINNED_KEYS_NOT_OFFERED", "WARN", "Configured pin(s) were not offered by the host: " + ", ".join(missing))
+
+      blocking = [finding for finding in findings if finding["severity"] == "BLOCK"]
+      warnings = [finding for finding in findings if finding["severity"] == "WARN"]
+      verdict = "FAIL" if blocking else ("PASS_WITH_WARNINGS" if warnings else "PASS")
+      report = {
+          "schemaVersion": 1,
+          "checkedAt": datetime.now(timezone.utc).isoformat(),
+          "host": host,
+          "port": port,
+          "requestedAlgorithms": key_types,
+          "observedHostKeys": observed,
+          "expectedFingerprints": expected,
+          "matchingFingerprints": matching,
+          "unexpectedFingerprints": unexpected,
+          "expectedFingerprintsNotObserved": missing,
+          "sshKeyscanExitCode": scan.returncode,
+          "findings": findings,
+          "blockingFindingCount": len(blocking),
+          "warningCount": len(warnings),
+          "verdict": verdict,
+          "trustNote": "A key scan is unauthenticated. Pins must be sourced independently from an official or otherwise trusted channel; never learn pins from the same scan being verified.",
+      }
+      with open("host-key-audit.json", "w", encoding="utf-8") as target:
+          json.dump(report, target, indent=2, ensure_ascii=False)
+
+      print(f"SSH host-key audit: {host}:{port} verdict={verdict}; observed={len(observed)}, matched={len(matching)}, unexpected={len(unexpected)}, missing_pins={len(missing)}")
+      Kestra.outputs({
+          "host": host,
+          "port": port,
+          "observed_host_keys": observed,
+          "matching_fingerprints": matching,
+          "unexpected_fingerprints": unexpected,
+          "missing_fingerprints": missing,
+          "blocking_finding_count": len(blocking),
+          "warning_count": len(warnings),
+          "verdict": verdict,
+          "findings": findings,
+      })
+
+  - id: enforce_host_key_trust
+    type: io.kestra.plugin.core.flow.If
+    description: Fail the execution and alert the owner when a host offers an unknown key or the scan observes no keys.
+    condition: "{{ outputs.scan_and_compare_host_keys.vars.verdict == 'FAIL' }}"
+    then:
+      - id: alert_host_key_drift
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        description: Send the host, port, unexpected fingerprints and execution link to the configured security channel.
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        payload: |-
+          {{
+            {
+              "text": ":rotating_light: SSH host-key trust drift detected\nHost: " ~ outputs.scan_and_compare_host_keys.vars.host ~
+                ":" ~ outputs.scan_and_compare_host_keys.vars.port ~
+                "\nUnexpected fingerprints: " ~ (outputs.scan_and_compare_host_keys.vars.unexpected_fingerprints | toJson) ~
+                "\nFindings: " ~ (outputs.scan_and_compare_host_keys.vars.findings | toJson) ~
+                "\nExecution: " ~ execution.id ~
+                "\nInspect host-key-audit.json before updating trusted pins."
+            } | toJson
+          }}
+      - id: fail_untrusted_host
+        type: io.kestra.plugin.core.execution.Fail
+        description: Stop downstream deployment or connection steps when SSH host identity cannot be trusted.
+        errorMessage: "SSH host-key trust policy failed for {{ outputs.scan_and_compare_host_keys.vars.host }}:{{ outputs.scan_and_compare_host_keys.vars.port }}. Review host-key-audit.json before allowing connections."
+    else:
+      - id: log_host_key_verdict
+        type: io.kestra.plugin.core.log.Log
+        level: INFO
+        message: "SSH host-key policy {{ outputs.scan_and_compare_host_keys.vars.verdict }} for {{ outputs.scan_and_compare_host_keys.vars.host }}:{{ outputs.scan_and_compare_host_keys.vars.port }}; {{ outputs.scan_and_compare_host_keys.vars.matching_fingerprints | length }} trusted key(s) matched."
+
+errors:
+  - id: alert_host_key_scan_failure
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    description: Alert when key scanning or fingerprinting itself fails instead of treating an incomplete scan as trusted.
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    payload: |-
+      {{
+        {
+          "text": ":warning: SSH host-key audit execution failed\nHost: " ~ inputs.host ~
+            ":" ~ inputs.port ~
+            "\nExecution: " ~ execution.id ~
+            "\nInspect task logs; do not treat a failed scan as a trusted result."
+        } | toJson
+      }}
+
+extend:
+  title: SSH Host-Key Rotation and Trust Drift Gate
+  metaTitle: SSH Host-Key Rotation and Trust Drift Gate | Kestra
+  shortDescription: Scan an SSH endpoint and compare its live SHA-256 host-key fingerprints with independently sourced pins before allowing trusted connections.
+  metaDescription: Detect SSH host-key rotation or unexpected fingerprints by comparing live ssh-keyscan results against independently sourced SHA-256 trust pins.
+  description: |
+    Detect SSH server identity drift before automation connects to an endpoint. The workflow obtains the public host keys offered by an SSH server, computes SHA-256 fingerprints locally, and compares them with a list of pins copied from an independent trusted source. Unknown fingerprints or an empty scan fail the gate and send a Slack alert. The JSON report includes observed algorithms, matched pins, missing pins, unexpected keys and the policy verdict.
+
+    ## How it works
+
+    1. validate_scan_policy verifies the hostname, port, key algorithms, fingerprint syntax and timeout before opening a connection.
+    2. scan_and_compare_host_keys runs ssh-keyscan in an isolated Python container and uses ssh-keygen -lf -E sha256 to fingerprint the returned keys.
+    3. The script compares observed keys against the explicitly configured trusted fingerprints. A fingerprint not on the trust list blocks the flow; pins not offered by the host can be reported as warnings.
+    4. enforce_host_key_trust routes unknown keys to Slack and a failing task, or logs the matched-key count for an accepted result.
+    5. The optional daily schedule can be enabled after the pin list and notification destination are reviewed.
+
+    ## What you get
+
+    - A machine-readable host-key-audit.json report with algorithms, observed fingerprints, trust matches and drift findings.
+    - A fail-closed policy for unknown fingerprints and empty scans.
+    - An alert path that provides evidence for incident response instead of silently replacing trusted keys.
+    - A repeatable check that can run before SSH deployment, backup, or fleet-maintenance workflows.
+
+    ## Who it's for
+
+    - Platform and security teams maintaining SSH access to servers and appliances.
+    - SREs who need to detect unannounced key rotation or a possible interception event.
+    - Operators who gate automated patching, backup, deployment or emergency maintenance on trusted server identity.
+
+    ## Why orchestrate this with Kestra
+
+    Kestra records each scan and its evidence, makes the trust policy reviewable as flow inputs, schedules rechecks, and routes a detected identity change to an alert plus a failing task that downstream operations can depend on.
+
+    ## Prerequisites
+
+    - A Kestra 2.x worker with Docker enabled for the Python Script task runner.
+    - Network egress from the task container to the target SSH hostname and port.
+    - The SLACK_WEBHOOK_URL secret for alert delivery.
+    - Trusted fingerprints obtained independently from an official or otherwise verified source. Do not automatically refresh the pins from the same host being scanned.
+
+    ### Secrets
+
+    - SLACK_WEBHOOK_URL: Slack incoming webhook used for unexpected keys and execution failures.
+
+    ## Quick start
+
+    1. Import the flow and run it with host=github.com, port=22, and the published GitHub fingerprints provided as defaults.
+    2. Review the trusted pin list against the [official GitHub SSH key fingerprints](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/githubs-ssh-key-fingerprints).
+    3. For another host, replace the default fingerprints using a separate trusted channel (such as the operator's security inventory or the service vendor's published fingerprint page).
+    4. Configure SLACK_WEBHOOK_URL before relying on alert delivery.
+    5. Run manually first; enable daily_host_key_audit only after approving the pin set and operational response to drift.
+
+    ## How to extend
+
+    - Store trusted pins per environment and compare staging and production host identities.
+    - Route a drift finding to an incident-management plugin and create an approval task before pin changes.
+    - Add an allowlist for approved host-key rotations with explicit expiry dates and reviewer attribution.
+    - Use the JSON report as deployment evidence alongside change tickets.
+
+    ## Links
+
+    - [GitHub SSH key fingerprints](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/githubs-ssh-key-fingerprints)
+    - [OpenSSH ssh-keyscan documentation](https://man.openbsd.org/ssh-keyscan)
+    - [OpenSSH ssh-keygen documentation](https://man.openbsd.org/ssh-keygen)
+    - [Kestra Python Script plugin](https://kestra.io/plugins/plugin-scripts/python)
+    - [Kestra Slack plugin](https://kestra.io/plugins/plugin-slack/slackincomingwebhook)
+  tags:
+    - Infrastructure
+  subTags:
+    - Policy & Compliance
+    - Monitoring & Alerting
+  ee: false
+  demo: false
