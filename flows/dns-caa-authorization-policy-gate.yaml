@@ -118,6 +118,12 @@ tasks:
       lookup_attempts = []
       effective_owner = None
       records = []
+
+      def text_field(value):
+          if isinstance(value, bytes):
+              return value.decode("utf-8", errors="replace")
+          return str(value)
+
       query_name = domain
 
       while query_name:
@@ -128,8 +134,8 @@ tasks:
                   for record in answer:
                       records.append({
                           "flags": int(record.flags),
-                          "tag": str(record.tag).lower(),
-                          "value": str(record.value).strip().strip('"'),
+                          "tag": text_field(record.tag).lower(),
+                          "value": text_field(record.value).strip().strip('"'),
                           "ttl": int(answer.rrset.ttl),
                       })
                   break
