@@ -1,0 +1,471 @@
+id: subresource-integrity-compliance-gate
+namespace: company.infrastructure
+description: |
+  Inspect a public HTTPS page for external JavaScript and stylesheet resources, identify
+  missing or malformed Subresource Integrity (SRI) hashes, and verify CORS attributes
+  required for cross-origin SRI. An optional bounded mode downloads the listed assets and
+  checks their bytes against the published hashes. Findings are written to JSON; strict
+  mode can fail a release gate when the page does not meet the declared policy.
+
+inputs:
+  - id: target_url
+    type: STRING
+    displayName: Target HTTPS page
+    defaults: https://github.com/kestra-io/blueprints
+    description: Public HTTPS HTML page to inspect.
+  - id: strict_mode
+    type: BOOL
+    displayName: Enforce SRI policy
+    defaults: false
+    description: When true, fail the flow for missing SRI on cross-origin scripts/styles, invalid hashes, insecure asset URLs, or missing cross-origin attributes.
+  - id: verify_asset_digests
+    type: BOOL
+    displayName: Download and verify asset digests
+    defaults: false
+    description: When enabled, download external script/style resources that have SRI metadata and compare their bytes to the hash. Downloads are bounded by the configured limits.
+  - id: maximum_resources
+    type: INT
+    displayName: Maximum resources to inspect
+    defaults: 40
+    description: Maximum number of external script and stylesheet resources processed per execution, from 1 to 200.
+  - id: maximum_asset_bytes
+    type: INT
+    displayName: Maximum asset bytes
+    defaults: 2000000
+    description: Maximum bytes downloaded for any one asset when digest verification is enabled, from 1 to 10000000.
+  - id: notify_slack
+    type: BOOL
+    displayName: Send Slack alerts
+    defaults: false
+    description: Enable only after configuring SLACK_WEBHOOK_URL in the Kestra namespace.
+  - id: archive_report
+    type: BOOL
+    displayName: Archive report to S3
+    defaults: false
+    description: Store the JSON audit report in S3. AWS credentials are required only when enabled.
+  - id: evidence_bucket
+    type: STRING
+    displayName: S3 evidence bucket
+    defaults: my-sri-audit-evidence
+    description: Existing S3 bucket used only when report archival is enabled.
+  - id: evidence_prefix
+    type: STRING
+    displayName: S3 evidence prefix
+    defaults: subresource-integrity-audits
+    description: Prefix for page-specific SRI audit reports.
+  - id: aws_region
+    type: STRING
+    displayName: AWS region
+    defaults: eu-west-1
+    description: Region containing the evidence bucket.
+
+triggers:
+  - id: weekday_sri_audit
+    type: io.kestra.plugin.core.trigger.Schedule
+    description: Recheck the page's external resource integrity policy every weekday. Enable after confirming the page, scan limits, and alert policy.
+    cron: "0 11 * * 1-5"
+    disabled: true
+
+tasks:
+  - id: validate_configuration
+    type: io.kestra.plugin.scripts.python.Script
+    description: Validate the HTTPS page URL and resource/byte limits before issuing requests.
+    containerImage: python:3.12-slim
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+    env:
+      TARGET_URL: "{{ inputs.target_url }}"
+      MAXIMUM_RESOURCES: "{{ inputs.maximum_resources }}"
+      MAXIMUM_ASSET_BYTES: "{{ inputs.maximum_asset_bytes }}"
+    script: |
+      import os
+      from urllib.parse import urlsplit
+
+      raw = os.environ.get("TARGET_URL", "").strip()
+      parsed = urlsplit(raw)
+      if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
+          raise ValueError("target_url must be an HTTPS URL without embedded credentials")
+      if parsed.fragment:
+          raise ValueError("target_url must not include a fragment")
+      try:
+          maximum_resources = int(os.environ.get("MAXIMUM_RESOURCES", "40"))
+          maximum_asset_bytes = int(os.environ.get("MAXIMUM_ASSET_BYTES", "2000000"))
+      except ValueError as exc:
+          raise ValueError("Resource and byte limits must be integers") from exc
+      if not 1 <= maximum_resources <= 200:
+          raise ValueError("maximum_resources must be between 1 and 200")
+      if not 1 <= maximum_asset_bytes <= 10000000:
+          raise ValueError("maximum_asset_bytes must be between 1 and 10000000")
+      print(f"Validated HTTPS page {parsed.scheme}://{parsed.netloc}; resources={maximum_resources}, per-asset bytes={maximum_asset_bytes}")
+
+  - id: audit_sri_resources
+    type: io.kestra.plugin.scripts.python.Script
+    description: Parse the actual HTML response, inspect external script and stylesheet SRI metadata, and optionally verify downloaded resource bytes with strict download size limits.
+    containerImage: python:3.12-slim
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+    dependencies:
+      - kestra
+    env:
+      TARGET_URL: "{{ inputs.target_url }}"
+      STRICT_MODE: "{{ inputs.strict_mode }}"
+      VERIFY_ASSET_DIGESTS: "{{ inputs.verify_asset_digests }}"
+      MAXIMUM_RESOURCES: "{{ inputs.maximum_resources }}"
+      MAXIMUM_ASSET_BYTES: "{{ inputs.maximum_asset_bytes }}"
+    outputFiles:
+      - subresource-integrity-report.json
+    script: |
+      import base64
+      import hashlib
+      import json
+      import os
+      import re
+      from datetime import datetime, timezone
+      from html.parser import HTMLParser
+      from urllib.parse import urljoin, urlsplit
+      from urllib.request import Request, urlopen
+
+      from kestra import Kestra
+
+      target_url = os.environ["TARGET_URL"].strip()
+      strict_mode = os.environ.get("STRICT_MODE", "false").lower() == "true"
+      verify_asset_digests = os.environ.get("VERIFY_ASSET_DIGESTS", "false").lower() == "true"
+      maximum_resources = int(os.environ.get("MAXIMUM_RESOURCES", "40"))
+      maximum_asset_bytes = int(os.environ.get("MAXIMUM_ASSET_BYTES", "2000000"))
+      target_origin = urlsplit(target_url)
+      findings = []
+      resource_records = []
+
+      def add(code, severity, message, resource_url=None):
+          finding = {"code": code, "severity": severity, "message": message}
+          if resource_url:
+              finding["resourceUrl"] = resource_url
+          findings.append(finding)
+
+      class ResourceParser(HTMLParser):
+          def __init__(self):
+              super().__init__(convert_charrefs=True)
+              self.resources = []
+          def handle_starttag(self, tag, attrs):
+              attributes = {str(k).lower(): (v or "") for k, v in attrs}
+              tag = tag.lower()
+              rel = set(attributes.get("rel", "").lower().split())
+              resource_type = None
+              raw_url = None
+              if tag == "script" and attributes.get("src"):
+                  resource_type = "script"
+                  raw_url = attributes["src"].strip()
+              elif tag == "link" and attributes.get("href"):
+                  if "stylesheet" in rel:
+                      resource_type = "stylesheet"
+                  elif "preload" in rel and attributes.get("as", "").lower() in {"script", "style"}:
+                      resource_type = attributes.get("as", "").lower()
+                  elif "modulepreload" in rel:
+                      resource_type = "script"
+                  raw_url = attributes["href"].strip() if resource_type else None
+              if resource_type and raw_url:
+                  self.resources.append({
+                      "type": resource_type,
+                      "rawUrl": raw_url,
+                      "integrity": attributes.get("integrity", "").strip(),
+                      "crossorigin": attributes.get("crossorigin", "").strip().lower(),
+                      "rel": attributes.get("rel", ""),
+                  })
+
+      def fetch_bytes(url, maximum_bytes):
+          request = Request(url, headers={
+              "Accept": "*/*",
+              "User-Agent": "Kestra-Subresource-Integrity-Compliance-Gate/1.0",
+          })
+          with urlopen(request, timeout=25) as response:
+              final_url = response.geturl()
+              if urlsplit(final_url).scheme != "https":
+                  raise ValueError("resource redirected away from HTTPS")
+              payload = response.read(maximum_bytes + 1)
+              if len(payload) > maximum_bytes:
+                  raise ValueError(f"resource exceeded configured {maximum_bytes}-byte download limit")
+              return payload, response.status, final_url
+
+      def parse_sri(value):
+          supported = {"sha256": 1, "sha384": 2, "sha512": 3}
+          tokens = []
+          for part in value.split():
+              if "-" not in part:
+                  continue
+              algorithm, digest = part.split("-", 1)
+              algorithm = algorithm.lower()
+              if algorithm not in supported:
+                  continue
+              digest = digest.split("?", 1)[0]
+              try:
+                  base64.b64decode(digest, validate=True)
+              except Exception:
+                  continue
+              tokens.append({"algorithm": algorithm, "digest": digest, "rank": supported[algorithm]})
+          if not tokens:
+              return []
+          strongest = max(token["rank"] for token in tokens)
+          return [token for token in tokens if token["rank"] == strongest]
+
+      try:
+          html_bytes, html_status, final_page_url = fetch_bytes(target_url, 5000000)
+          if not 200 <= html_status < 300:
+              raise ValueError(f"HTML request returned HTTP {html_status}")
+          html = html_bytes.decode("utf-8", "replace")
+          parser = ResourceParser()
+          parser.feed(html)
+          page_origin = urlsplit(final_page_url)
+          collected = parser.resources
+          if len(collected) > maximum_resources:
+              add("RESOURCE_LIMIT_REACHED", "WARN", f"Page exposes {len(collected)} script/style resources; only first {maximum_resources} are inspected.")
+              collected = collected[:maximum_resources]
+
+          for resource in collected:
+              raw_url = resource["rawUrl"]
+              if raw_url.startswith(("data:", "javascript:", "blob:")):
+                  continue
+              absolute_url = urljoin(final_page_url, raw_url)
+              parts = urlsplit(absolute_url)
+              if parts.scheme not in {"http", "https"} or not parts.hostname:
+                  add("RESOURCE_URL_INVALID", "WARN", "Resource URL could not be resolved to HTTP(S).", absolute_url)
+                  continue
+              is_cross_origin = (parts.scheme.lower(), parts.hostname.lower(), parts.port) != (
+                  page_origin.scheme.lower(), (page_origin.hostname or "").lower(), page_origin.port
+              )
+              record = {
+                  "type": resource["type"],
+                  "url": absolute_url,
+                  "crossOrigin": is_cross_origin,
+                  "integrityAttributePresent": bool(resource["integrity"]),
+                  "integrityAlgorithms": [],
+                  "crossoriginAttribute": resource["crossorigin"] or None,
+                  "digestVerified": None,
+                  "httpStatus": None,
+              }
+              resource_records.append(record)
+
+              if parts.scheme != "https":
+                  add("INSECURE_RESOURCE_URL", "BLOCK" if strict_mode else "WARN", "Script/style resource uses HTTP instead of HTTPS.", absolute_url)
+
+              tokens = parse_sri(resource["integrity"]) if resource["integrity"] else []
+              record["integrityAlgorithms"] = sorted({token["algorithm"] for token in tokens})
+              if is_cross_origin and not resource["integrity"]:
+                  add("CROSS_ORIGIN_SRI_MISSING", "BLOCK" if strict_mode else "WARN", "Cross-origin script/stylesheet has no usable integrity attribute.", absolute_url)
+                  continue
+              if resource["integrity"] and not tokens:
+                  add("SRI_HASH_INVALID", "BLOCK" if strict_mode else "WARN", "Integrity attribute has no supported sha256/sha384/sha512 hash token.", absolute_url)
+                  continue
+              if is_cross_origin and resource["integrity"] and resource["crossorigin"] not in {"anonymous", "use-credentials"}:
+                  add("CROSS_ORIGIN_ATTRIBUTE_MISSING", "BLOCK" if strict_mode else "WARN", "Cross-origin SRI resource should declare crossorigin so the browser can enforce integrity.", absolute_url)
+
+              if verify_asset_digests and tokens:
+                  try:
+                      asset_bytes, asset_status, final_asset_url = fetch_bytes(absolute_url, maximum_asset_bytes)
+                      record["httpStatus"] = asset_status
+                      record["finalUrl"] = final_asset_url
+                      if not 200 <= asset_status < 300:
+                          raise ValueError(f"resource returned HTTP {asset_status}")
+                      verified = False
+                      for token in tokens:
+                          actual = base64.b64encode(hashlib.new(token["algorithm"], asset_bytes).digest()).decode("ascii")
+                          if actual == token["digest"]:
+                              verified = True
+                              break
+                      record["digestVerified"] = verified
+                      if not verified:
+                          add("SRI_DIGEST_MISMATCH", "BLOCK" if strict_mode else "WARN", "Downloaded resource bytes do not match any strongest supported SRI digest in the markup.", absolute_url)
+                  except Exception as exc:
+                      record["digestVerified"] = False
+                      add("ASSET_DIGEST_CHECK_FAILED", "BLOCK" if strict_mode else "WARN", f"Could not verify resource bytes: {exc}", absolute_url)
+
+      except Exception as exc:
+          add("PAGE_AUDIT_FAILED", "BLOCK", f"Could not inspect the target page: {exc}")
+
+      blocking = [item for item in findings if item["severity"] == "BLOCK"]
+      warnings = [item for item in findings if item["severity"] == "WARN"]
+      verdict = "FAIL" if blocking else ("PASS_WITH_WARNINGS" if warnings else "PASS")
+      report = {
+          "schemaVersion": 1,
+          "checkedAt": datetime.now(timezone.utc).isoformat(),
+          "targetUrl": target_url,
+          "finalPageUrl": locals().get("final_page_url"),
+          "htmlStatus": locals().get("html_status"),
+          "strictMode": strict_mode,
+          "verifyAssetDigests": verify_asset_digests,
+          "maximumResources": maximum_resources,
+          "maximumAssetBytes": maximum_asset_bytes,
+          "inspectedResourceCount": len(resource_records),
+          "resources": resource_records,
+          "findings": findings,
+          "blockingFindingCount": len(blocking),
+          "warningCount": len(warnings),
+          "verdict": verdict,
+          "scopeNote": "The scan inspects script/stylesheet URLs present in the returned HTML, not dynamically inserted browser resources. Digest verification is optional and downloads at most the configured byte limit per resource. This is a policy aid, not a full browser security test.",
+      }
+      with open("subresource-integrity-report.json", "w", encoding="utf-8") as target:
+          json.dump(report, target, indent=2, ensure_ascii=False)
+
+      print(f"Subresource Integrity audit: target={target_url}, resources={len(resource_records)}, strict={strict_mode}, verify_bytes={verify_asset_digests}, verdict={verdict}, blocking={len(blocking)}, warnings={len(warnings)}")
+      print("SRI findings: " + json.dumps(findings, ensure_ascii=False))
+      Kestra.outputs({
+          "target_url": target_url,
+          "final_page_url": locals().get("final_page_url", ""),
+          "html_status": locals().get("html_status"),
+          "inspected_resource_count": len(resource_records),
+          "blocking_finding_count": len(blocking),
+          "warning_count": len(warnings),
+          "verdict": verdict,
+          "findings": findings,
+      })
+
+  - id: optionally_archive_report
+    type: io.kestra.plugin.core.flow.If
+    description: Optionally retain the SRI audit evidence in S3.
+    condition: "{{ inputs.archive_report }}"
+    then:
+      - id: upload_sri_report
+        type: io.kestra.plugin.aws.s3.Upload
+        description: Store the JSON SRI report; resources are downloaded only when verify_asset_digests is enabled.
+        accessKeyId: "{{ secret('AWS_ACCESS_KEY_ID') }}"
+        secretKeyId: "{{ secret('AWS_SECRET_ACCESS_KEY') }}"
+        region: "{{ inputs.aws_region }}"
+        bucket: "{{ inputs.evidence_bucket }}"
+        from: "{{ outputs.audit_sri_resources.outputFiles['subresource-integrity-report.json'] }}"
+        key: "{{ inputs.evidence_prefix }}/{{ inputs.repository | replace('/', '_') }}/subresource-integrity-{{ execution.id }}.json"
+
+  - id: enforce_sri_policy
+    type: io.kestra.plugin.core.flow.If
+    description: Fail only when strict mode has produced blocking SRI findings.
+    condition: "{{ inputs.strict_mode and outputs.audit_sri_resources.vars.verdict == 'FAIL' }}"
+    then:
+      - id: optionally_alert_sri_failure
+        type: io.kestra.plugin.core.flow.If
+        description: Send an alert only when enabled and the webhook secret is configured.
+        condition: "{{ inputs.notify_slack }}"
+        then:
+          - id: alert_sri_failure
+            type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+            description: Alert the page owner about blocking SRI findings.
+            url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+            payload: |-
+              {{
+                {
+                  "text": ":warning: Subresource Integrity policy BLOCKED\nTarget: " ~ inputs.target_url ~
+                    "\nFindings: " ~ (outputs.audit_sri_resources.vars.findings | toJson) ~
+                    "\nExecution: " ~ execution.id ~
+                    "\nReview subresource-integrity-report.json before relying on the page's external resources."
+                } | toJson
+              }}
+      - id: fail_sri_gate
+        type: io.kestra.plugin.core.execution.Fail
+        description: Stop downstream promotion when strict SRI policy fails.
+        errorMessage: "Subresource Integrity policy failed for {{ inputs.target_url }}. Review subresource-integrity-report.json."
+    else:
+      - id: log_sri_verdict
+        type: io.kestra.plugin.core.log.Log
+        level: INFO
+        message: "SRI audit {{ outputs.audit_sri_resources.vars.verdict }} for {{ inputs.target_url }}; resources={{ outputs.audit_sri_resources.vars.inspected_resource_count }}."
+
+errors:
+  - id: optionally_alert_execution_failure
+    type: io.kestra.plugin.core.flow.If
+    description: Send technical execution failure notifications only when enabled.
+    condition: "{{ inputs.notify_slack }}"
+    then:
+      - id: alert_execution_failure
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        description: Alert when network, parsing, or orchestration failures prevent an audit.
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        payload: |-
+          {{
+            {
+              "text": ":warning: SRI audit execution failed\nTarget: " ~ inputs.target_url ~
+                "\nExecution: " ~ execution.id ~
+                "\nInspect Kestra logs; execution failure is not a passing SRI result."
+            } | toJson
+          }}
+
+outputs:
+  - id: sri_audit
+    type: JSON
+    description: Machine-readable page resources, SRI attributes, optional digest verification, findings, and policy verdict.
+    value: "{{ outputs.audit_sri_resources.vars | toJson }}"
+
+extend:
+  title: Subresource Integrity Compliance Gate
+  metaTitle: Subresource Integrity Compliance Gate | Kestra
+  shortDescription: Inspect external scripts and stylesheets for SRI hashes and CORS attributes, with optional bounded verification of the actual resource bytes.
+  metaDescription: Audit HTTPS pages for missing or invalid SRI metadata on external scripts and stylesheets, then optionally verify their hashes before release.
+  description: |
+    Inspect a live HTTPS page for external JavaScript and stylesheet resources that may execute in a browser. The flow parses the returned HTML, identifies missing or invalid Subresource Integrity (SRI) attributes, checks the crossorigin attribute for cross-origin resources, and can optionally download a bounded number of assets to compare their bytes with the strongest supported hash in the markup. It writes a JSON evidence report, optionally archives it to S3, and provides an explicit strict-mode gate.
+
+    ## How it works
+
+    1. Validate the target HTTPS URL and per-execution resource/byte limits.
+    2. Fetch the actual HTML document and parse script, stylesheet, preload and modulepreload references.
+    3. Resolve resource URLs against the final page URL and distinguish same-origin from cross-origin assets.
+    4. Check for supported SHA-256, SHA-384 or SHA-512 SRI tokens and the crossorigin attribute for cross-origin resources.
+    5. Optionally download eligible assets within a configured size limit and compare actual bytes against the strongest supported SRI hash.
+    6. Write a machine-readable report, optionally archive it, and fail only when strict mode is enabled and blocking findings exist.
+
+    ## What you get
+
+    - An inventory of external scripts and stylesheets in the HTML response.
+    - Detection of cross-origin resources with missing or malformed SRI metadata.
+    - Detection of insecure HTTP asset URLs and missing crossorigin attributes.
+    - Optional byte-for-byte validation against published SRI digests with per-resource download limits.
+    - A JSON report and optional S3 retention plus Slack alerting for strict-policy failures.
+
+    ## Who it's for
+
+    - Frontend teams reviewing third-party JavaScript and stylesheet supply-chain exposure.
+    - Security engineers enforcing integrity metadata for CDN-hosted assets.
+    - Platform teams checking production and preview pages for SRI drift.
+
+    ## Why orchestrate this with Kestra
+
+    Kestra makes the scan repeatable, configurable and observable, records evidence with each execution, and gives downstream delivery flows a clear strict-policy result instead of relying on an ad hoc browser inspection.
+
+    ## Prerequisites
+
+    - Kestra 2.x workers with Docker enabled for the Python Script task runner.
+    - Network access from workers to the target page and any assets when byte verification is enabled.
+    - Optional Slack incoming webhook and optional S3 bucket with write access.
+    - Review target ownership and resource-download limits before scanning production sites.
+
+    ### Secrets
+
+    - SLACK_WEBHOOK_URL: optional Slack incoming webhook; required only when notify_slack is true.
+    - AWS_ACCESS_KEY_ID: optional AWS access key used only when report archival is enabled.
+    - AWS_SECRET_ACCESS_KEY: optional AWS secret key used only when report archival is enabled.
+
+    ## Quick start
+
+    1. Import the flow and start with https://github.com/kestra-io/blueprints as a public HTTPS page example.
+    2. Execute in audit mode with strict_mode disabled and review the sri_audit output plus subresource-integrity-report.json.
+    3. Enable verify_asset_digests only after choosing resource and per-asset byte limits suitable for the target site.
+    4. Review false positives and the returned HTML's static resource inventory, then enable strict_mode if the policy requires SRI for cross-origin code.
+    5. Configure optional alert/report integrations before enabling the schedule trigger.
+
+    ## How to extend
+
+    - Add allowlists for specific CDN hosts and approved exceptions.
+    - Compare the scanned resources against a reviewed inventory committed to Git.
+    - Include dynamically loaded assets using a browser-based test runner where available.
+    - Enforce a separate CSP policy and compare response headers to complement SRI checks.
+
+    ## Links
+
+    - [MDN Subresource Integrity guide](https://developer.mozilla.org/en-US/docs/Web/Security/Subresource_Integrity)
+    - [SRI specification](https://www.w3.org/TR/SRI/)
+    - [CORS settings attributes](https://developer.mozilla.org/en-US/docs/Web/HTML/Attributes/crossorigin)
+    - [Kestra Python Script plugin](https://kestra.io/plugins/plugin-scripts/python)
+    - [Kestra Slack Incoming Webhook plugin](https://kestra.io/plugins/plugin-slack/slackincomingwebhook)
+    - [Kestra AWS S3 plugin](https://kestra.io/plugins/plugin-aws/s3)
+  tags:
+    - Infrastructure
+  subTags:
+    - Policy & Compliance
+    - Monitoring & Alerting
+  ee: false
+  demo: false
