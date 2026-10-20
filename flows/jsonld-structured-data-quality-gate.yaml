@@ -1,0 +1,446 @@
+id: jsonld-structured-data-quality-gate
+namespace: company.web
+description: |
+  Audit the JSON-LD structured data embedded in a public web page before SEO or content release.
+  The flow downloads a bounded HTML document from an explicit HTTPS host allowlist, parses each
+  application/ld+json block, validates JSON syntax and basic context/type structure, checks that
+  expected schema types are present, and detects repeated entity identifiers. It emits a JSON
+  report, can alert Slack, and can fail a strict publication gate without modifying the page.
+
+inputs:
+  - id: page_url
+    type: STRING
+    displayName: Page URL
+    defaults: https://developers.google.com/search/docs/appearance/structured-data/article
+    description: HTTPS URL of the public page whose JSON-LD is to be audited.
+  - id: allowed_hosts
+    type: STRING
+    displayName: Allowed page hosts
+    defaults: developers.google.com
+    description: Comma-separated exact hostnames accepted for the page and every redirect.
+  - id: expected_types
+    type: STRING
+    displayName: Expected schema types
+    defaults: Article,TechArticle
+    description: Comma-separated schema.org types; at least one should be present when require_expected_type is enabled.
+  - id: require_expected_type
+    type: BOOL
+    displayName: Require expected type
+    defaults: true
+    description: Block if no JSON-LD entity matches any expected schema type.
+  - id: maximum_html_bytes
+    type: INT
+    displayName: Maximum HTML bytes
+    defaults: 3000000
+    description: Maximum response size, from 1024 to 10000000 bytes.
+  - id: minimum_jsonld_blocks
+    type: INT
+    displayName: Minimum JSON-LD blocks
+    defaults: 1
+    description: Minimum number of valid JSON-LD script blocks required.
+  - id: strict_mode
+    type: BOOL
+    displayName: Fail on blocking findings
+    defaults: true
+    description: When enabled, fail if JSON-LD cannot be parsed or required schema types are missing.
+  - id: notify_slack
+    type: BOOL
+    displayName: Send Slack alert
+    defaults: false
+    description: Enable only after configuring SLACK_WEBHOOK_URL in the Kestra namespace.
+
+triggers:
+  - id: weekly_structured_data_audit
+    type: io.kestra.plugin.core.trigger.Schedule
+    description: Optional weekly recheck of the configured page; disabled until the page and expected schema types are approved.
+    cron: "0 9 * * 1"
+    disabled: true
+
+tasks:
+  - id: validate_request
+    type: io.kestra.plugin.scripts.python.Script
+    description: Validate the page URL, exact host allowlist, expected type list and response-size limit before fetching HTML.
+    containerImage: python:3.12-slim
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+    env:
+      PAGE_URL: "{{ inputs.page_url }}"
+      ALLOWED_HOSTS: "{{ inputs.allowed_hosts }}"
+      EXPECTED_TYPES: "{{ inputs.expected_types }}"
+      MAXIMUM_HTML_BYTES: "{{ inputs.maximum_html_bytes }}"
+    script: |
+      import os
+      import re
+      from urllib.parse import urlsplit
+
+      page_url = os.environ.get("PAGE_URL", "").strip()
+      parsed = urlsplit(page_url)
+      if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
+          raise ValueError("page_url must be HTTPS and must not contain embedded credentials")
+      if parsed.port not in (None, 443):
+          raise ValueError("page_url must use the default HTTPS port")
+      hosts = [item.strip().lower() for item in os.environ.get("ALLOWED_HOSTS", "").split(",") if item.strip()]
+      if not hosts or parsed.hostname.lower() not in hosts:
+          raise ValueError("the page URL host must exactly match one of allowed_hosts")
+      if any(not re.fullmatch(r"[a-z0-9.-]+", item) or item.startswith(".") or item.endswith(".") for item in hosts):
+          raise ValueError("allowed_hosts must contain plain DNS hostnames, not wildcards or URLs")
+      expected_types = [item.strip() for item in os.environ.get("EXPECTED_TYPES", "").split(",") if item.strip()]
+      if not expected_types:
+          raise ValueError("expected_types must contain at least one schema.org type")
+      maximum_html_bytes = int(os.environ["MAXIMUM_HTML_BYTES"])
+      if not 1024 <= maximum_html_bytes <= 10_000_000:
+          raise ValueError("maximum_html_bytes must be between 1024 and 10000000")
+      print(f"Validated page URL and expected schema types: {', '.join(expected_types)}.")
+
+  - id: audit_jsonld
+    type: io.kestra.plugin.scripts.python.Script
+    description: Fetch a bounded HTML response, validate redirects and inspect application/ld+json blocks without executing page scripts.
+    containerImage: python:3.12-slim
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+    dependencies:
+      - kestra
+    env:
+      PAGE_URL: "{{ inputs.page_url }}"
+      ALLOWED_HOSTS: "{{ inputs.allowed_hosts }}"
+      EXPECTED_TYPES: "{{ inputs.expected_types }}"
+      REQUIRE_EXPECTED_TYPE: "{{ inputs.require_expected_type }}"
+      MAXIMUM_HTML_BYTES: "{{ inputs.maximum_html_bytes }}"
+      MINIMUM_JSONLD_BLOCKS: "{{ inputs.minimum_jsonld_blocks }}"
+    outputFiles:
+      - structured-data-report.json
+    script: |
+      import hashlib
+      import html.parser
+      import ipaddress
+      import json
+      import os
+      import socket
+      import time
+      import urllib.error
+      import urllib.parse
+      import urllib.request
+      from datetime import datetime, timezone
+
+      from kestra import Kestra
+
+      page_url = os.environ["PAGE_URL"].strip()
+      allowed_hosts = {item.strip().lower() for item in os.environ.get("ALLOWED_HOSTS", "").split(",") if item.strip()}
+      expected_types = {item.strip() for item in os.environ.get("EXPECTED_TYPES", "").split(",") if item.strip()}
+      require_expected_type = os.environ.get("REQUIRE_EXPECTED_TYPE", "true").lower() == "true"
+      maximum_html_bytes = int(os.environ["MAXIMUM_HTML_BYTES"])
+      minimum_blocks = int(os.environ["MINIMUM_JSONLD_BLOCKS"])
+
+      findings = []
+      redirect_chain = []
+      final_url = None
+      response_bytes = 0
+      blocks_found = []
+      valid_block_count = 0
+      entity_count = 0
+      entity_types_seen = set()
+      matched_types = set()
+      duplicate_ids = []
+      malformed_blocks = []
+
+      def add(code, severity, message):
+          findings.append({"code": code, "severity": severity, "message": message})
+
+      def validate_public_https_url(url):
+          parsed = urllib.parse.urlsplit(url)
+          if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
+              raise ValueError("redirect target must be HTTPS without embedded credentials")
+          if parsed.port not in (None, 443):
+              raise ValueError("redirect target used a non-default HTTPS port")
+          hostname = parsed.hostname.lower()
+          if hostname not in allowed_hosts:
+              raise ValueError(f"redirect host '{hostname}' is not in allowed_hosts")
+          try:
+              addresses = socket.getaddrinfo(hostname, 443, type=socket.SOCK_STREAM)
+          except socket.gaierror as exc:
+              raise ValueError(f"could not resolve allowed host '{hostname}': {exc}") from exc
+          resolved = {entry[4][0] for entry in addresses}
+          if not resolved:
+              raise ValueError(f"host '{hostname}' did not resolve")
+          for address in resolved:
+              ip = ipaddress.ip_address(address.split("%", 1)[0])
+              if not ip.is_global:
+                  raise ValueError(f"host '{hostname}' resolved to a non-public address")
+          return hostname
+
+      class AllowlistedRedirectHandler(urllib.request.HTTPRedirectHandler):
+          def redirect_request(self, req, fp, code, msg, headers, newurl):
+              target = urllib.parse.urljoin(req.full_url, newurl)
+              hostname = validate_public_https_url(target)
+              redirect_chain.append({"from": req.full_url, "to": target, "host": hostname, "status": int(code)})
+              return super().redirect_request(req, fp, code, msg, headers, target)
+
+      class JsonLdParser(html.parser.HTMLParser):
+          def __init__(self):
+              super().__init__(convert_charrefs=False)
+              self._in_jsonld = False
+              self._chunks = []
+              self.blocks = []
+
+          def handle_starttag(self, tag, attrs):
+              if tag.lower() != "script":
+                  return
+              attributes = {key.lower(): (value or "") for key, value in attrs}
+              media_type = attributes.get("type", "").split(";", 1)[0].strip().lower()
+              if media_type == "application/ld+json":
+                  self._in_jsonld = True
+                  self._chunks = []
+
+          def handle_data(self, data):
+              if self._in_jsonld:
+                  self._chunks.append(data)
+
+          def handle_endtag(self, tag):
+              if tag.lower() == "script" and self._in_jsonld:
+                  self.blocks.append("".join(self._chunks))
+                  self._in_jsonld = False
+                  self._chunks = []
+
+      def walk_entities(value, inherited_context=False):
+          if isinstance(value, list):
+              for item in value:
+                  yield from walk_entities(item, inherited_context)
+          elif isinstance(value, dict):
+              context_present = inherited_context or ("@context" in value and bool(value.get("@context")))
+              types = value.get("@type", [])
+              if isinstance(types, str):
+                  types = [types]
+              if isinstance(types, list) and types:
+                  normalized = [str(item).rsplit("/", 1)[-1] for item in types if item]
+                  yield value, context_present, normalized
+              graph = value.get("@graph")
+              if graph is not None:
+                  yield from walk_entities(graph, context_present)
+
+      started = time.monotonic()
+      try:
+          validate_public_https_url(page_url)
+          request = urllib.request.Request(
+              page_url,
+              headers={"User-Agent": "Kestra-Structured-Data-Quality-Gate/1.0", "Accept": "text/html,application/xhtml+xml"},
+          )
+          opener = urllib.request.build_opener(AllowlistedRedirectHandler())
+          with opener.open(request, timeout=20) as response:
+              final_url = response.geturl()
+              validate_public_https_url(final_url)
+              content_type = (response.headers.get("Content-Type") or "").lower()
+              payload = response.read(maximum_html_bytes + 1)
+          response_bytes = len(payload)
+          if response_bytes > maximum_html_bytes:
+              raise ValueError(f"HTML response exceeded maximum_html_bytes ({maximum_html_bytes})")
+          if content_type and "html" not in content_type and "xhtml" not in content_type:
+              add("CONTENT_TYPE_NOT_HTML", "WARN", f"Server returned content type {content_type[:120]!r}, not HTML.")
+          html_text = payload.decode("utf-8", "replace")
+          parser = JsonLdParser()
+          parser.feed(html_text)
+          blocks_found = parser.blocks
+          if len(blocks_found) < minimum_blocks:
+              add("JSONLD_BLOCK_COUNT_BELOW_MINIMUM", "BLOCK", f"Found {len(blocks_found)} JSON-LD block(s), below minimum_jsonld_blocks ({minimum_blocks}).")
+          all_entity_ids = {}
+          for block_index, block in enumerate(blocks_found, start=1):
+              if not block.strip():
+                  malformed_blocks.append(block_index)
+                  add("JSONLD_BLOCK_EMPTY", "BLOCK", f"JSON-LD block {block_index} is empty.")
+                  continue
+              try:
+                  document = json.loads(block)
+              except json.JSONDecodeError as exc:
+                  malformed_blocks.append(block_index)
+                  add("JSONLD_JSON_INVALID", "BLOCK", f"JSON-LD block {block_index} is invalid JSON at line {exc.lineno}, column {exc.colno}.")
+                  continue
+              valid_block_count += 1
+              block_entities = list(walk_entities(document))
+              if not block_entities:
+                  add("JSONLD_ENTITY_TYPE_MISSING", "BLOCK", f"JSON-LD block {block_index} has no entity with a non-empty @type.")
+              for entity, has_context, types in block_entities:
+                  entity_count += 1
+                  if not has_context:
+                      add("JSONLD_CONTEXT_MISSING", "BLOCK", f"Entity in block {block_index} has no @context inherited from its document.")
+                  entity_types_seen.update(types)
+                  matched_types.update(expected_types.intersection(types))
+                  entity_id = entity.get("@id")
+                  if isinstance(entity_id, str) and entity_id.strip():
+                      canonical_id = entity_id.strip()
+                      fingerprint = hashlib.sha256(json.dumps(entity, sort_keys=True, default=str).encode("utf-8")).hexdigest()
+                      if canonical_id in all_entity_ids and all_entity_ids[canonical_id] != fingerprint:
+                          duplicate_ids.append(canonical_id[:300])
+                      else:
+                          all_entity_ids[canonical_id] = fingerprint
+          if malformed_blocks:
+              add("JSONLD_MALFORMED_BLOCKS", "BLOCK", f"{len(malformed_blocks)} JSON-LD block(s) could not be parsed.")
+          if require_expected_type and not matched_types:
+              add("EXPECTED_SCHEMA_TYPE_MISSING", "BLOCK", "No JSON-LD entity matched any expected type: " + ", ".join(sorted(expected_types)))
+          if duplicate_ids:
+              add("DUPLICATE_ENTITY_IDS", "WARN", "Different entity payloads share the same @id: " + ", ".join(duplicate_ids[:20]))
+          if time.monotonic() - started > 120:
+              add("FETCH_OR_PARSE_SLOW", "WARN", "Page fetch and JSON-LD parsing took longer than 120 seconds.")
+      except urllib.error.HTTPError as exc:
+          detail = ""
+          try:
+              detail = exc.read(1000).decode("utf-8", "replace")
+          except Exception:
+              pass
+          add("PAGE_FETCH_FAILED", "BLOCK", f"Page returned HTTP {exc.code}: {detail[:300]}")
+      except Exception as exc:
+          add("STRUCTURED_DATA_AUDIT_FAILED", "BLOCK", str(exc)[:1000])
+
+      blocking = [item for item in findings if item["severity"] == "BLOCK"]
+      warnings = [item for item in findings if item["severity"] == "WARN"]
+      verdict = "FAIL" if blocking else ("PASS_WITH_WARNINGS" if warnings else "PASS")
+      report = {
+          "schemaVersion": 1,
+          "checkedAt": datetime.now(timezone.utc).isoformat(),
+          "sourceUrl": page_url,
+          "finalUrl": final_url,
+          "redirectChain": redirect_chain,
+          "responseBytes": response_bytes,
+          "jsonLdBlockCount": len(blocks_found),
+          "validJsonLdBlockCount": valid_block_count,
+          "entityCount": entity_count,
+          "entityTypesSeen": sorted(entity_types_seen),
+          "expectedTypes": sorted(expected_types),
+          "matchedExpectedTypes": sorted(matched_types),
+          "malformedBlocks": malformed_blocks,
+          "duplicateEntityIds": duplicate_ids[:100],
+          "findings": findings,
+          "blockingFindingCount": len(blocking),
+          "warningCount": len(warnings),
+          "verdict": verdict,
+          "scopeNote": "This checks JSON-LD syntax and a lightweight structural contract only. It does not prove search-engine eligibility, schema.org semantic validity, or rich-result eligibility.",
+      }
+      with open("structured-data-report.json", "w", encoding="utf-8") as target:
+          json.dump(report, target, indent=2, ensure_ascii=False)
+      print(f"Structured data audit: blocks={len(blocks_found)}, valid={valid_block_count}, entities={entity_count}, types={','.join(sorted(entity_types_seen))}, verdict={verdict}, blocking={len(blocking)}.")
+      Kestra.outputs({
+          "source_url": page_url,
+          "final_url": final_url or "",
+          "response_bytes": response_bytes,
+          "jsonld_block_count": len(blocks_found),
+          "valid_jsonld_block_count": valid_block_count,
+          "entity_count": entity_count,
+          "entity_types_seen": sorted(entity_types_seen),
+          "matched_expected_types": sorted(matched_types),
+          "blocking_finding_count": len(blocking),
+          "warning_count": len(warnings),
+          "verdict": verdict,
+          "findings": findings,
+      })
+
+  - id: notify_on_structured_data_failure
+    type: io.kestra.plugin.core.flow.If
+    description: Notify Slack when JSON-LD cannot be parsed or required structured types are absent.
+    condition: "{{ inputs.notify_slack and outputs.audit_jsonld.vars.blocking_finding_count > 0 }}"
+    then:
+      - id: send_structured_data_alert
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        description: Send the public page URL and categorized JSON-LD findings to Slack.
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        payload: |-
+          {{
+            {
+              "text": ":warning: Structured-data quality gate failed\nPage: " ~ outputs.audit_jsonld.vars.source_url ~
+                "\nTypes: " ~ (outputs.audit_jsonld.vars.entity_types_seen | join(", ")) ~
+                "\nFindings: " ~ (outputs.audit_jsonld.vars.findings | toJson) ~
+                "\nExecution: " ~ execution.id ~
+                "\nReview structured-data-report.json."
+            } | toJson
+          }}
+
+  - id: enforce_structured_data_policy
+    type: io.kestra.plugin.core.flow.If
+    description: Fail closed when the required JSON-LD contract is missing or malformed.
+    condition: "{{ inputs.strict_mode and outputs.audit_jsonld.vars.blocking_finding_count > 0 }}"
+    then:
+      - id: fail_structured_data_gate
+        type: io.kestra.plugin.core.execution.Fail
+        description: Stop page publication when its structured-data payload violates the configured contract.
+        errorMessage: "Structured-data quality gate failed. Review structured-data-report.json."
+    else:
+      - id: log_structured_data_verdict
+        type: io.kestra.plugin.core.log.Log
+        level: INFO
+        message: "Structured-data verdict={{ outputs.audit_jsonld.vars.verdict }}; entities={{ outputs.audit_jsonld.vars.entity_count }}; types={{ outputs.audit_jsonld.vars.entity_types_seen | join(', ') }}."
+
+outputs:
+  - id: structured_data_report
+    type: JSON
+    description: Machine-readable page URL, schema types, JSON-LD parsing results, and structural findings.
+    value: "{{ outputs.audit_jsonld.vars | toJson }}"
+
+extend:
+  title: JSON-LD Structured Data Quality Gate
+  metaTitle: JSON-LD Structured Data Quality Gate | Kestra
+  shortDescription: Validate public-page JSON-LD syntax, context/type structure and expected schema types before an SEO or content release.
+  metaDescription: Gate public pages on valid JSON-LD blocks, schema contexts and expected types, with optional Slack alerts and strict publication enforcement.
+  description: |
+    Validate JSON-LD structured data embedded in a public web page before SEO or content release. The flow fetches a bounded HTML response from an explicit HTTPS host allowlist, parses application/ld+json blocks, validates JSON syntax and basic context/type structure, checks that expected schema types are present, and identifies conflicting repeated entity identifiers. It creates a JSON report, can alert Slack, and can fail a strict publication gate without executing page scripts or changing the site.
+
+    ## How it works
+
+    1. The validation task checks the page URL, exact host allowlist, expected schema type list and maximum response size.
+    2. The audit task downloads the HTML using a redirect-safe allowlisted HTTP client and extracts only application/ld+json script blocks.
+    3. Each block is parsed as JSON. The audit checks for typed entities, an inherited or explicit @context and presence of at least one configured expected schema type.
+    4. The report records observed types, entity counts, malformed block indexes and categorized findings.
+    5. An optional Slack branch sends a summary, and strict mode fails the flow for blocking structured-data violations.
+
+    ## What you get
+
+    - A machine-readable report of JSON-LD blocks, valid blocks, entities, observed types and required-type matches.
+    - Detection of invalid JSON, empty blocks, missing context/type and absent expected schema types.
+    - A bounded public-page fetch that rejects off-allowlist redirects and non-public DNS addresses.
+    - Optional alerting and a strict gate before publishing a web page.
+
+    ## Who it's for
+
+    - Technical SEO teams maintaining structured data and rich-result markup.
+    - Web platform teams validating product, article and organization metadata.
+    - Content engineering teams catching broken JSON-LD before a site release.
+
+    ## Why orchestrate this with Kestra
+
+    The source URL, report, structural findings and fail-closed release decision are tracked in a single execution. The same gate can be run manually for a page update or scheduled for recurring validation without executing browser scripts.
+
+    ## Prerequisites
+
+    - A Kestra 2.x worker with Docker enabled for the Python Script runner.
+    - Network access to the explicitly allowed public HTTPS page host.
+    - A public page that includes JSON-LD script blocks.
+
+    ### Secrets
+
+    - SLACK_WEBHOOK_URL: Slack incoming webhook; required only when notify_slack is enabled.
+
+    ## Quick start
+
+    1. Import the flow and run it against the configured Google Search documentation example.
+    2. Review structured-data-report.json and the structured_data_report output.
+    3. Replace page_url and set allowed_hosts to the exact page and redirect hostnames.
+    4. Set expected_types to the schema.org types required by the publishing team.
+    5. Configure SLACK_WEBHOOK_URL before enabling alerts. Keep the schedule disabled until the page and policy are approved.
+
+    ## How to extend
+
+    - Add type-specific field requirements for Product, Article, Recipe or Organization.
+    - Validate schema.org properties with a dedicated schema library or Google's Rich Results Test.
+    - Compare structured-data reports before and after a content release.
+    - Connect a passing result to an SEO deployment or publishing workflow.
+
+    ## Links
+
+    - [Schema.org](https://schema.org/)
+    - [Google structured data guidance](https://developers.google.com/search/docs/appearance/structured-data/intro-structured-data)
+    - [Python HTMLParser documentation](https://docs.python.org/3/library/html.parser.html)
+    - [Python JSON documentation](https://docs.python.org/3/library/json.html)
+    - [Kestra Python Script plugin](https://kestra.io/plugins/plugin-scripts/python)
+    - [Kestra Slack plugin](https://kestra.io/plugins/plugin-slack/slackincomingwebhook)
+  tags:
+    - Data
+  subTags:
+    - Testing & Quality
+  ee: false
+  demo: false
