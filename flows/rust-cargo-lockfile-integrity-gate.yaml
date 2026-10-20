@@ -456,7 +456,7 @@ extend:
   tags:
     - Infrastructure
   subTags:
-    - Policy & Compliance
     - CI/CD & Deployment
+    - Infrastructure Automation
   ee: false
   demo: false
