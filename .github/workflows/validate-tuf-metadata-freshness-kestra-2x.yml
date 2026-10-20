@@ -138,6 +138,21 @@ jobs:
               print(f"Execution {execution_id}: {state}")
               if state in {"SUCCESS", "FAILED", "WARNING", "KILLED", "CANCELLED"}:
                   print(json.dumps(last, indent=2))
+                  task_runs = last.get("taskRunList") or []
+                  for task_run in task_runs:
+                      task_id = task_run.get("taskId", "")
+                      task_state = (task_run.get("state") or {}).get("current")
+                      task_run_id = task_run.get("id")
+                      print(f"Task result: {task_id}={task_state}, taskRunId={task_run_id}")
+                      if task_id == "inspect_tuf_metadata" and task_run_id:
+                          output_url = f"http://127.0.0.1:8080/api/v1/main/outputs/tasks/{execution_id}/{task_run_id}"
+                          try:
+                              output_req = urllib.request.Request(output_url, headers={"Authorization": f"Basic {auth}"})
+                              with urllib.request.urlopen(output_req, timeout=20) as response:
+                                  print("TUF AUDIT TASK OUTPUT:")
+                                  print(json.dumps(json.load(response), indent=2))
+                          except Exception as exc:
+                              print(f"Unable to fetch TUF audit output: {exc}")
                   if state not in {"SUCCESS", "WARNING"}:
                       logs_url = f"http://127.0.0.1:8080/api/v1/main/logs/{execution_id}"
                       try:
