@@ -316,7 +316,7 @@ tasks:
       - id: log_submodule_verdict
         type: io.kestra.plugin.core.log.Log
         level: INFO
-        message: "Git submodule audit {{ outputs.audit_submodule_pins.vars.verdict }} for {{ outputs.audit_submodule_pins.vars.repository }}; declared={{ outputs.audit_submodule_pins.vars.declared_submodule_count }}, gitlinks={{ outputs.audit_submodule_pins.vars.gitlink_count }}."
+        message: "Git submodule audit {{ outputs.audit_submodule_pins.vars.verdict }} for {{ outputs.audit_submodule_pins.vars.repository }}; declared={{ outputs.audit_submodule_pins.vars.declared_submodule_count }}, verified={{ outputs.audit_submodule_pins.vars.verified_submodule_count }}, unverified={{ outputs.audit_submodule_pins.vars.unverified_submodule_count }}."
 
 errors:
   - id: alert_submodule_audit_failure
