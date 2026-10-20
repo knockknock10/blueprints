@@ -33,6 +33,11 @@ inputs:
     displayName: Inspect metadata roles referenced by snapshot
     defaults: true
     description: Fetch role metadata listed in snapshot metadata and verify advertised versions, lengths and hashes.
+  - id: notify_slack
+    type: BOOL
+    displayName: Send Slack alerts
+    defaults: false
+    description: Enable only after configuring SLACK_WEBHOOK_URL in the Kestra namespace. When false, the flow records findings without attempting Slack requests.
   - id: maximum_role_metadata_files
     type: INT
     displayName: Maximum metadata role files to inspect
@@ -203,7 +208,13 @@ tasks:
           })
 
       def versioned_filename(name, version):
-          return f"{int(version)}.{name}" if consistent_snapshot else name
+          if not consistent_snapshot:
+              return name
+          # TUF consistent snapshots prefix the metadata basename while keeping
+          # delegated-role directories, e.g. targets/3.role.json.
+          directory, separator, basename = name.rpartition("/")
+          prefixed = f"{int(version)}.{basename}"
+          return f"{directory}/{prefixed}" if separator else prefixed
 
       try:
           timestamp_raw, timestamp_doc = fetch_metadata("timestamp.json")
@@ -319,6 +330,7 @@ tasks:
       timestamp_version = report.get("timestampVersion", 0)
       snapshot_version = report.get("snapshotVersion", 0)
       print(f"TUF metadata audit: timestamp={timestamp_version}, snapshot={snapshot_version}, inspected_roles={report.get('inspectedRoleMetadataCount', 0)}, verdict={verdict}, blocking={report['blockingFindingCount']}, warnings={report['warningCount']}")
+      print("TUF audit findings: " + json.dumps(report.get("findings", []), ensure_ascii=False))
       Kestra.outputs({
           "metadata_base_url": base_url,
           "timestamp_version": timestamp_version,
@@ -350,45 +362,53 @@ tasks:
     description: Fail closed when metadata is expired, version-inconsistent, or fails an advertised hash/length check.
     condition: "{{ outputs.inspect_tuf_metadata.vars.verdict == 'FAIL' }}"
     then:
-      - id: alert_blocked_metadata
-        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
-        description: Alert the repository owner that metadata needs investigation.
-        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
-        payload: |-
-          {{
-            {
-              "text": ":rotating_light: TUF metadata audit BLOCKED\nRepository: " ~ inputs.metadata_base_url ~
-                "\nTimestamp version: " ~ (outputs.inspect_tuf_metadata.vars.timestamp_version | string) ~
-                "\nSnapshot version: " ~ (outputs.inspect_tuf_metadata.vars.snapshot_version | string) ~
-                "\nFindings: " ~ (outputs.inspect_tuf_metadata.vars.findings | toJson) ~
-                "\nExecution: " ~ execution.id ~
-                "\nReview tuf-metadata-audit.json and verify metadata with a standards-compliant TUF client."
-            } | toJson
-          }}
+      - id: optionally_alert_blocked_metadata
+        type: io.kestra.plugin.core.flow.If
+        description: Send Slack only when explicitly enabled and its webhook secret is configured.
+        condition: "{{ inputs.notify_slack }}"
+        then:
+          - id: alert_blocked_metadata
+            type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+            description: Alert the repository owner that metadata needs investigation.
+            url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+            payload: |-
+              {{
+                {
+                  "text": ":rotating_light: TUF metadata audit BLOCKED\nRepository: " ~ inputs.metadata_base_url ~
+                    "\nTimestamp version: " ~ (outputs.inspect_tuf_metadata.vars.timestamp_version | string) ~
+                    "\nSnapshot version: " ~ (outputs.inspect_tuf_metadata.vars.snapshot_version | string) ~
+                    "\nFindings: " ~ (outputs.inspect_tuf_metadata.vars.findings | toJson) ~
+                    "\nExecution: " ~ execution.id ~
+                    "\nReview tuf-metadata-audit.json and verify metadata with a standards-compliant TUF client."
+                } | toJson
+              }}
       - id: fail_freshness_gate
         type: io.kestra.plugin.core.execution.Fail
-        description: Stop downstream promotion after alerting on blocked metadata.
+        description: Stop downstream promotion after recording blocked metadata findings.
         errorMessage: "TUF metadata freshness/version policy failed for {{ inputs.metadata_base_url }}. Review tuf-metadata-audit.json."
     else:
       - id: log_metadata_verdict
         type: io.kestra.plugin.core.log.Log
         level: INFO
         message: "TUF metadata audit {{ outputs.inspect_tuf_metadata.vars.verdict }} for {{ inputs.metadata_base_url }}; timestamp={{ outputs.inspect_tuf_metadata.vars.timestamp_version }}, snapshot={{ outputs.inspect_tuf_metadata.vars.snapshot_version }}."
-
 errors:
-  - id: alert_audit_execution_failure
-    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
-    description: Alert when network, parsing, or orchestration failures prevent an audit.
-    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
-    payload: |-
-      {{
-        {
-          "text": ":warning: TUF metadata audit execution failed\nRepository: " ~ inputs.metadata_base_url ~
-            "\nExecution: " ~ execution.id ~
-            "\nInspect Kestra logs; execution failures are not a passing freshness result."
-        } | toJson
-      }}
-
+  - id: optionally_alert_execution_failure
+    type: io.kestra.plugin.core.flow.If
+    description: Send failure notifications only when explicitly enabled.
+    condition: "{{ inputs.notify_slack }}"
+    then:
+      - id: alert_audit_execution_failure
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        description: Alert when network, parsing, or orchestration failures prevent an audit.
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        payload: |-
+          {{
+            {
+              "text": ":warning: TUF metadata audit execution failed\\nRepository: " ~ inputs.metadata_base_url ~
+                "\\nExecution: " ~ execution.id ~
+                "\\nInspect Kestra logs; execution failures are not a passing freshness result."
+            } | toJson
+          }}
 outputs:
   - id: metadata_audit
     type: JSON
@@ -432,12 +452,12 @@ extend:
 
     - Kestra 2.x with Docker enabled for the Python Script task runner.
     - Network access from workers to the public TUF metadata endpoint.
-    - Optional Slack incoming webhook and optional S3 bucket with write access.
+    - Optional Slack incoming webhook (set notify_slack to true) and optional S3 bucket with write access.
     - A trusted, out-of-band timestamp version baseline if rollback comparison is desired.
 
     ### Secrets
 
-    - SLACK_WEBHOOK_URL: Slack incoming webhook for blocked metadata and task failures.
+    - SLACK_WEBHOOK_URL: Slack incoming webhook for blocked metadata and task failures; only required when notify_slack is true.
     - AWS_ACCESS_KEY_ID: optional AWS access key used only when report archival is enabled.
     - AWS_SECRET_ACCESS_KEY: optional AWS secret key used only when report archival is enabled.
 
