@@ -459,7 +459,7 @@ extend:
   tags:
     - Infrastructure
   subTags:
-    - Policy & Compliance
-    - Testing & Quality
+    - Infrastructure Automation
+    - CI/CD & Deployment
   ee: false
   demo: false
