@@ -1,0 +1,481 @@
+id: npm-lockfile-integrity-policy-gate
+namespace: company.supplychain
+description: |
+  Check a public Node.js repository's package.json and package-lock.json before dependency installation
+  or release. The workflow verifies manifest-to-lockfile name, version, and direct dependency consistency;
+  requires a modern npm lockfile format; reviews registry artifact HTTPS URLs and Subresource Integrity
+  hashes; and checks that Git dependencies use immutable commit hashes. It writes an auditable JSON report,
+  alerts on blocking findings, and can optionally archive evidence to S3. It validates lock metadata and
+  declared integrity fields, but does not download every tarball or independently recompute each digest.
+
+inputs:
+  - id: repository
+    type: STRING
+    displayName: GitHub repository
+    defaults: npm/cli
+    description: Public GitHub repository in owner/name format.
+  - id: default_branch
+    type: STRING
+    displayName: Branch or ref
+    defaults: latest
+    description: Branch or tag containing the package manifest and lockfile.
+  - id: manifest_path
+    type: STRING
+    displayName: package.json path
+    defaults: package.json
+    description: Repository-relative path to package.json.
+  - id: lockfile_path
+    type: STRING
+    displayName: package-lock.json path
+    defaults: package-lock.json
+    description: Repository-relative path to package-lock.json.
+  - id: minimum_lockfile_version
+    type: INT
+    displayName: Minimum npm lockfile version
+    defaults: 2
+    description: Block lockfiles older than this version. Set to 2 or 3 for modern npm lockfiles.
+  - id: require_sha512_integrity
+    type: BOOL
+    displayName: Require SHA-512 integrity
+    defaults: true
+    description: Require registry artifacts to include a SHA-512 Subresource Integrity digest.
+  - id: require_https
+    type: BOOL
+    displayName: Require HTTPS resolutions
+    defaults: true
+    description: Block package resolution URLs that use cleartext HTTP.
+  - id: require_immutable_git_refs
+    type: BOOL
+    displayName: Require immutable Git refs
+    defaults: true
+    description: Block Git dependencies that do not end with a full 40- or 64-character commit hash.
+  - id: minimum_package_count
+    type: INT
+    displayName: Minimum locked package count
+    defaults: 1
+    description: Minimum number of non-root package entries expected in the lockfile.
+  - id: archive_report
+    type: BOOL
+    displayName: Archive report to S3
+    defaults: false
+    description: Save the JSON evidence report to S3. AWS secrets are required only when enabled.
+  - id: evidence_bucket
+    type: STRING
+    displayName: Evidence bucket
+    defaults: my-supply-chain-evidence
+    description: Existing S3 bucket used when report archival is enabled.
+  - id: evidence_prefix
+    type: STRING
+    displayName: Evidence prefix
+    defaults: npm-lockfile-integrity
+    description: Prefix for repository-specific lockfile reports.
+  - id: aws_region
+    type: STRING
+    displayName: AWS region
+    defaults: eu-west-1
+    description: Region of the evidence bucket.
+
+triggers:
+  - id: weekly_lockfile_audit
+    type: io.kestra.plugin.core.trigger.Schedule
+    description: Recheck the selected dependency lockfile weekly. Enable once the repository and policy thresholds are configured.
+    cron: "0 8 * * 1"
+    disabled: true
+
+tasks:
+  - id: validate_request
+    type: io.kestra.plugin.scripts.python.Script
+    description: Validate repository, ref, file paths, and numeric thresholds before fetching public GitHub content.
+    containerImage: python:3.12-slim
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+    env:
+      REPOSITORY: "{{ inputs.repository }}"
+      DEFAULT_BRANCH: "{{ inputs.default_branch }}"
+      MANIFEST_PATH: "{{ inputs.manifest_path }}"
+      LOCKFILE_PATH: "{{ inputs.lockfile_path }}"
+      MINIMUM_LOCKFILE_VERSION: "{{ inputs.minimum_lockfile_version }}"
+      MINIMUM_PACKAGE_COUNT: "{{ inputs.minimum_package_count }}"
+    script: |
+      import os
+      import re
+
+      repository = os.environ.get("REPOSITORY", "").strip()
+      ref = os.environ.get("DEFAULT_BRANCH", "").strip()
+      manifest_path = os.environ.get("MANIFEST_PATH", "").strip()
+      lockfile_path = os.environ.get("LOCKFILE_PATH", "").strip()
+      minimum_lock = int(os.environ.get("MINIMUM_LOCKFILE_VERSION", "2"))
+      minimum_packages = int(os.environ.get("MINIMUM_PACKAGE_COUNT", "1"))
+
+      if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository):
+          raise ValueError("repository must be a public GitHub owner/name pair")
+      if not ref or any(char in ref for char in "\r\n"):
+          raise ValueError("default_branch must be a non-empty single-line ref")
+      for label, path in (("manifest_path", manifest_path), ("lockfile_path", lockfile_path)):
+          if not path or path.startswith("/") or ".." in path.split("/"):
+              raise ValueError(f"{label} must be a repository-relative path")
+      if minimum_lock < 2:
+          raise ValueError("minimum_lockfile_version must be 2 or 3 for this policy")
+      if minimum_packages < 0:
+          raise ValueError("minimum_package_count cannot be negative")
+
+      print(f"Validated npm lockfile request for {repository}:{ref}")
+
+  - id: fetch_manifest
+    type: io.kestra.plugin.core.http.Request
+    description: Read the public package manifest directly from the selected GitHub ref.
+    uri: "https://raw.githubusercontent.com/{{ inputs.repository }}/{{ inputs.default_branch }}/{{ inputs.manifest_path }}"
+    method: GET
+    headers:
+      Accept: application/json
+      User-Agent: Kestra-Npm-Lockfile-Integrity-Gate/1.0
+    timeout: PT30S
+
+  - id: fetch_lockfile
+    type: io.kestra.plugin.core.http.Request
+    description: Fetch the exact package-lock.json contents from the same repository ref so manifest and lockfile comparisons are reproducible.
+    uri: "https://raw.githubusercontent.com/{{ inputs.repository }}/{{ inputs.default_branch }}/{{ inputs.lockfile_path }}"
+    method: GET
+    headers:
+      Accept: application/json
+      User-Agent: Kestra-Npm-Lockfile-Integrity-Gate/1.0
+    timeout: PT30S
+
+  - id: audit_lockfile
+    type: io.kestra.plugin.scripts.python.Script
+    description: Compare manifest and lockfile metadata, require modern lockfile structure, and audit registry URL security and integrity fields plus immutable Git dependency pins.
+    containerImage: python:3.12-slim
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+    beforeCommands:
+      - pip install kestra
+    inputFiles:
+      package-manifest.json: "{{ outputs.fetch_manifest.body }}"
+      package-lock.json: "{{ outputs.fetch_lockfile.body }}"
+    env:
+      REPOSITORY: "{{ inputs.repository }}"
+      MANIFEST_PATH: "{{ inputs.manifest_path }}"
+      LOCKFILE_PATH: "{{ inputs.lockfile_path }}"
+      MINIMUM_LOCKFILE_VERSION: "{{ inputs.minimum_lockfile_version }}"
+      REQUIRE_SHA512: "{{ inputs.require_sha512_integrity }}"
+      REQUIRE_HTTPS: "{{ inputs.require_https }}"
+      REQUIRE_IMMUTABLE_GIT: "{{ inputs.require_immutable_git_refs }}"
+      MINIMUM_PACKAGE_COUNT: "{{ inputs.minimum_package_count }}"
+    outputFiles:
+      - npm-lockfile-audit.json
+    script: |
+      import json
+      import os
+      import re
+      from collections import Counter
+      from datetime import datetime, timezone
+
+      from kestra import Kestra
+
+      repository = os.environ["REPOSITORY"].strip()
+      manifest_path = os.environ["MANIFEST_PATH"].strip()
+      lockfile_path = os.environ["LOCKFILE_PATH"].strip()
+      minimum_lockfile_version = int(os.environ.get("MINIMUM_LOCKFILE_VERSION", "2"))
+      require_sha512 = os.environ.get("REQUIRE_SHA512", "true").lower() == "true"
+      require_https = os.environ.get("REQUIRE_HTTPS", "true").lower() == "true"
+      require_immutable_git = os.environ.get("REQUIRE_IMMUTABLE_GIT", "true").lower() == "true"
+      minimum_package_count = int(os.environ.get("MINIMUM_PACKAGE_COUNT", "1"))
+
+      with open("package-manifest.json", encoding="utf-8") as source:
+          manifest = json.load(source)
+      with open("package-lock.json", encoding="utf-8") as source:
+          lockfile = json.load(source)
+
+      if not isinstance(manifest, dict):
+          raise ValueError("package.json must be a JSON object")
+      if not isinstance(lockfile, dict):
+          raise ValueError("package-lock.json must be a JSON object")
+      lockfile_version = lockfile.get("lockfileVersion")
+      if not isinstance(lockfile_version, int):
+          raise ValueError("package-lock.json must contain an integer lockfileVersion")
+
+      packages = lockfile.get("packages")
+      if not isinstance(packages, dict):
+          raise ValueError("Modern npm lockfile must contain a packages object")
+      root = packages.get("")
+      if not isinstance(root, dict):
+          raise ValueError("Modern npm lockfile is missing the root packages entry")
+
+      findings = []
+      def add(code, severity, message, package_path=None):
+          findings.append({
+              "code": code,
+              "severity": severity,
+              "packagePath": package_path,
+              "message": message,
+          })
+
+      if lockfile_version < minimum_lockfile_version:
+          add("LOCKFILE_VERSION_TOO_OLD", "BLOCK", f"lockfileVersion {lockfile_version} is below the configured minimum {minimum_lockfile_version}.")
+      if lockfile.get("name") and manifest.get("name") and lockfile["name"] != manifest["name"]:
+          add("ROOT_NAME_MISMATCH", "BLOCK", f"package-lock name {lockfile['name']!r} differs from package.json name {manifest['name']!r}.")
+      if lockfile.get("version") and manifest.get("version") and lockfile["version"] != manifest["version"]:
+          add("ROOT_VERSION_MISMATCH", "BLOCK", f"package-lock version {lockfile['version']!r} differs from package.json version {manifest['version']!r}.")
+      for field in ("name", "version"):
+          if root.get(field) and manifest.get(field) and root[field] != manifest[field]:
+              add("ROOT_PACKAGE_METADATA_MISMATCH", "BLOCK", f"packages[''].{field} does not match package.json.")
+
+      dependency_fields = ("dependencies", "devDependencies", "optionalDependencies")
+      for field in dependency_fields:
+          manifest_deps = manifest.get(field, {}) or {}
+          locked_deps = root.get(field, {}) or {}
+          if not isinstance(manifest_deps, dict) or not isinstance(locked_deps, dict):
+              add("ROOT_DEPENDENCY_SHAPE_INVALID", "BLOCK", f"{field} must be a JSON object in package.json and the lockfile root.")
+              continue
+          for name, spec in manifest_deps.items():
+              if name not in locked_deps:
+                  add("DIRECT_DEPENDENCY_MISSING_FROM_LOCK", "BLOCK", f"{name} is in package.json {field} but missing from the lockfile root.", name)
+              elif locked_deps[name] != spec:
+                  add("DIRECT_DEPENDENCY_SPEC_MISMATCH", "BLOCK", f"{name} has package.json spec {spec!r} but lockfile root records {locked_deps[name]!r}.", name)
+          for name in locked_deps:
+              if name not in manifest_deps:
+                  add("LOCKED_DIRECT_DEPENDENCY_NOT_IN_MANIFEST", "BLOCK", f"{name} is in lockfile root {field} but absent from package.json.", name)
+
+      package_entries = [(path, item) for path, item in packages.items() if path]
+      if len(package_entries) < minimum_package_count:
+          add("PACKAGE_COUNT_BELOW_MINIMUM", "BLOCK", f"Found {len(package_entries)} non-root package entries, below minimum {minimum_package_count}.")
+
+      invalid_package_shapes = []
+      missing_versions = []
+      missing_registry_integrity = []
+      missing_sha512_integrity = []
+      insecure_urls = []
+      mutable_git_refs = []
+      git_dependency_count = 0
+      registry_package_count = 0
+      sha512_integrity_count = 0
+      url_re = re.compile(r"^https?://", re.IGNORECASE)
+      git_re = re.compile(r"^(?:git\+|git://|github:)", re.IGNORECASE)
+      full_commit_re = re.compile(r"#(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})$")
+      sha512_re = re.compile(r"(?:^|\s)sha512-[A-Za-z0-9+/]+={0,2}(?:\s|$)")
+
+      for package_path, item in package_entries:
+          if not isinstance(item, dict):
+              invalid_package_shapes.append(package_path)
+              add("PACKAGE_ENTRY_INVALID", "BLOCK", "Package entry must be a JSON object.", package_path)
+              continue
+          if item.get("link") is True:
+              continue
+          version = item.get("version")
+          resolved = str(item.get("resolved") or "").strip()
+          integrity = str(item.get("integrity") or "").strip()
+          in_bundle = item.get("inBundle") is True or item.get("bundled") is True
+          if not version and not in_bundle:
+              missing_versions.append(package_path)
+              add("PACKAGE_VERSION_MISSING", "BLOCK", "Non-root package entry has no version and is not marked as bundled.", package_path)
+          if resolved and url_re.match(resolved):
+              if require_https and resolved.lower().startswith("http://"):
+                  insecure_urls.append({"path": package_path, "url": resolved})
+                  add("INSECURE_RESOLUTION_URL", "BLOCK", "Package resolution URL uses cleartext HTTP.", package_path)
+          if git_re.match(resolved):
+              git_dependency_count += 1
+              if require_immutable_git and not full_commit_re.search(resolved):
+                  mutable_git_refs.append({"path": package_path, "resolved": resolved})
+                  add("GIT_REF_NOT_IMMUTABLE", "BLOCK", "Git dependency resolution does not end in a full 40- or 64-character commit hash.", package_path)
+          if "registry.npmjs.org" in resolved:
+              registry_package_count += 1
+              if require_sha512 and not sha512_re.search(integrity):
+                  if not integrity:
+                      missing_registry_integrity.append(package_path)
+                      add("REGISTRY_INTEGRITY_MISSING", "BLOCK", "Registry artifact has no integrity field.", package_path)
+                  else:
+                      missing_sha512_integrity.append(package_path)
+                      add("SHA512_INTEGRITY_MISSING", "BLOCK", "Registry artifact integrity does not include a SHA-512 digest.", package_path)
+              if sha512_re.search(integrity):
+                  sha512_integrity_count += 1
+
+      blocking = [finding for finding in findings if finding["severity"] == "BLOCK"]
+      warnings = [finding for finding in findings if finding["severity"] == "WARN"]
+      verdict = "FAIL" if blocking else ("PASS_WITH_WARNINGS" if warnings else "PASS")
+      report = {
+          "schemaVersion": 1,
+          "checkedAt": datetime.now(timezone.utc).isoformat(),
+          "repository": repository,
+          "manifestPath": manifest_path,
+          "lockfilePath": lockfile_path,
+          "manifestName": manifest.get("name"),
+          "manifestVersion": manifest.get("version"),
+          "lockfileName": lockfile.get("name"),
+          "lockfileVersion": lockfile_version,
+          "minimumLockfileVersion": minimum_lockfile_version,
+          "packageEntryCount": len(package_entries),
+          "registryPackageCount": registry_package_count,
+          "sha512IntegrityCount": sha512_integrity_count,
+          "gitDependencyCount": git_dependency_count,
+          "missingVersions": missing_versions,
+          "missingRegistryIntegrity": missing_registry_integrity,
+          "missingSha512Integrity": missing_sha512_integrity,
+          "insecureResolutionUrls": insecure_urls,
+          "mutableGitRefs": mutable_git_refs,
+          "invalidPackageShapes": invalid_package_shapes,
+          "findings": findings,
+          "blockingFindingCount": len(blocking),
+          "warningCount": len(warnings),
+          "verdict": verdict,
+          "scopeNote": "The audit checks lockfile metadata and integrity declarations; it does not download package tarballs or recalculate each digest.",
+      }
+      with open("npm-lockfile-audit.json", "w", encoding="utf-8") as target:
+          json.dump(report, target, indent=2, ensure_ascii=False)
+
+      print(f"npm lockfile integrity audit: {repository} verdict={verdict}; packages={len(package_entries)}, registry={registry_package_count}, SHA-512={sha512_integrity_count}, blocking={len(blocking)}")
+      Kestra.outputs({
+          "repository": repository,
+          "manifest_path": manifest_path,
+          "lockfile_path": lockfile_path,
+          "manifest_name": manifest.get("name", ""),
+          "manifest_version": manifest.get("version", ""),
+          "lockfile_version": lockfile_version,
+          "package_entry_count": len(package_entries),
+          "registry_package_count": registry_package_count,
+          "sha512_integrity_count": sha512_integrity_count,
+          "git_dependency_count": git_dependency_count,
+          "blocking_finding_count": len(blocking),
+          "warning_count": len(warnings),
+          "findings": findings,
+          "verdict": verdict,
+      })
+
+  - id: optionally_archive_report
+    type: io.kestra.plugin.core.flow.If
+    description: Optionally archive the JSON report in S3 for release evidence.
+    condition: "{{ inputs.archive_report }}"
+    then:
+      - id: upload_lockfile_report
+        type: io.kestra.plugin.aws.s3.Upload
+        description: Archive the generated report without copying dependency archives.
+        accessKeyId: "{{ secret('AWS_ACCESS_KEY_ID') }}"
+        secretKeyId: "{{ secret('AWS_SECRET_ACCESS_KEY') }}"
+        region: "{{ inputs.aws_region }}"
+        bucket: "{{ inputs.evidence_bucket }}"
+        from: "{{ outputs.audit_lockfile.outputFiles['npm-lockfile-audit.json'] }}"
+        key: "{{ inputs.evidence_prefix }}/{{ inputs.repository | replace('/', '_') }}/npm-lockfile-audit.json"
+
+  - id: enforce_lockfile_policy
+    type: io.kestra.plugin.core.flow.If
+    description: Fail closed when lockfile, manifest, URL or integrity requirements are not satisfied.
+    condition: "{{ outputs.audit_lockfile.vars.verdict == 'FAIL' }}"
+    then:
+      - id: alert_blocked_lockfile
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        description: Notify maintainers about a lockfile integrity or consistency failure.
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        payload: |-
+          {{
+            {
+              "text": ":rotating_light: npm lockfile integrity gate BLOCKED\\nRepository: " ~ outputs.audit_lockfile.vars.repository ~
+                "\\nLockfile version: " ~ outputs.audit_lockfile.vars.lockfile_version ~
+                "\\nFindings: " ~ (outputs.audit_lockfile.vars.findings | toJson) ~
+                "\\nExecution: " ~ execution.id ~
+                "\\nReview npm-lockfile-audit.json for details."
+            } | toJson
+          }}
+      - id: fail_lockfile_gate
+        type: io.kestra.plugin.core.execution.Fail
+        description: Block downstream dependency installation or release when package integrity policy fails.
+        errorMessage: "npm lockfile integrity policy failed for {{ outputs.audit_lockfile.vars.repository }}. Review npm-lockfile-audit.json."
+    else:
+      - id: log_lockfile_verdict
+        type: io.kestra.plugin.core.log.Log
+        level: INFO
+        message: "npm lockfile audit {{ outputs.audit_lockfile.vars.verdict }} for {{ outputs.audit_lockfile.vars.repository }}; packages={{ outputs.audit_lockfile.vars.package_entry_count }}, blocking={{ outputs.audit_lockfile.vars.blocking_finding_count }}."
+
+errors:
+  - id: alert_lockfile_audit_failure
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    description: Alert when fetching, parsing or evaluating a lockfile fails so orchestration errors are not mistaken for passing policy.
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    payload: |-
+      {{
+        {
+          "text": ":warning: npm lockfile audit execution failed\\nRepository: " ~ inputs.repository ~
+            "\\nExecution: " ~ execution.id ~
+            "\\nInspect Kestra logs; API and parsing failures must not be interpreted as PASS."
+        } | toJson
+      }}
+
+outputs:
+  - id: lockfile_audit
+    type: JSON
+    description: Machine-readable package counts, integrity coverage, metadata consistency checks and policy verdict.
+    value: "{{ outputs.audit_lockfile.vars | toJson }}"
+
+extend:
+  title: npm Lockfile Integrity and Manifest Consistency Gate
+  metaTitle: npm Lockfile Integrity and Manifest Consistency Gate | Kestra
+  shortDescription: Verify package.json and package-lock.json agree and audit npm lockfile versions, HTTPS resolutions, SHA-512 integrity declarations and immutable Git pins.
+  metaDescription: Gate npm releases on manifest-to-lock consistency, modern package-lock versions, HTTPS artifact URLs, SHA-512 integrity metadata and immutable Git dependencies.
+  description: |
+    Check a public Node.js repository's package.json and package-lock.json before running dependency installation or promoting a release. The workflow compares root metadata and direct dependency specifications, verifies a modern npm lockfile structure, reviews registry resolution URLs and integrity declarations, and checks Git dependencies for immutable commit pins. It emits an evidence report, can archive it to S3, and fails closed when policy checks are not met.
+
+    ## How it works
+
+    1. Validate the repository, branch, file paths and minimum policy thresholds.
+    2. Fetch package.json and package-lock.json from the same GitHub ref through raw public repository URLs.
+    3. Compare name, version and direct dependency specifications between the manifest and lockfile root.
+    4. Inspect lockfile package entries for modern format, versions, HTTPS resolutions, SHA-512 registry integrity and immutable Git dependency pins.
+    5. Optionally archive the report to S3, then route a blocked verdict to Slack and a failed task.
+
+    ## What you get
+
+    - A machine-readable report listing locked package counts, registry artifact coverage, immutable Git pins and blocking findings.
+    - Detection of direct dependency drift between package.json and the root lockfile metadata.
+    - Detection of cleartext resolution URLs, missing registry integrity digests and movable Git references.
+    - Optional S3 evidence storage without downloading dependency tarballs.
+
+    ## Who it's for
+
+    - JavaScript platform teams validating dependency lockfiles before release.
+    - Supply-chain security engineers enforcing artifact-integrity policy.
+    - Maintainers checking changes to package manifests and lockfiles during dependency upgrades.
+
+    ## Why orchestrate this with Kestra
+
+    Kestra combines the manifest fetch, lockfile fetch, structured audit, conditional archive, alert path and blocking failure into one auditable workflow with recorded task outputs and execution history.
+
+    ## Prerequisites
+
+    - A Kestra 2.x worker with Docker enabled for the Python Script task runner.
+    - Network access to raw.githubusercontent.com.
+    - A Slack incoming webhook for blocking alerts; S3 archival is optional.
+
+    ### Secrets
+
+    - SLACK_WEBHOOK_URL: Slack incoming webhook for a blocked policy result or execution error.
+    - AWS_ACCESS_KEY_ID: optional AWS access key used only when report archival is enabled.
+    - AWS_SECRET_ACCESS_KEY: optional AWS secret key used only when report archival is enabled.
+
+    ## Quick start
+
+    1. Import the flow with repository npm/cli, branch latest and default manifest/lockfile paths for a public real-world example.
+    2. Execute once and inspect npm-lockfile-audit.json and the lockfile_audit output.
+    3. Set minimum_lockfile_version, require_sha512_integrity, require_https and require_immutable_git_refs to match local policy.
+    4. Configure Slack before relying on blocking alerts.
+    5. Enable weekly_lockfile_audit after reviewing the first report; enable S3 storage only after configuring the bucket and secrets.
+
+    ## How to extend
+
+    - Compare package.json optional and peer dependency groups with additional ecosystem-specific rules.
+    - Fetch package tarballs and recalculate digests for a stronger byte-level verification mode.
+    - Add a dependency allowlist for internal registries or approved Git hosts.
+    - Require a passing lockfile audit before downstream packaging or publication.
+
+    ## Links
+
+    - [npm package-lock.json documentation](https://docs.npmjs.com/cli/v11/configuring-npm/package-lock-json)
+    - [GitHub Contents and raw file access](https://docs.github.com/en/repositories/working-with-files/using-files/getting-permanent-links-to-files)
+    - [Kestra HTTP Request plugin](https://kestra.io/plugins/plugin-core/http/io.kestra.plugin.core.http.request)
+    - [Kestra Python Script plugin](https://kestra.io/plugins/plugin-scripts/python)
+    - [Kestra Slack plugin](https://kestra.io/plugins/plugin-slack/slackincomingwebhook)
+    - [Kestra AWS S3 plugin](https://kestra.io/plugins/plugin-aws/s3)
+  tags:
+    - Infrastructure
+  subTags:
+    - Policy & Compliance
+    - CI/CD & Deployment
+  ee: false
+  demo: false
