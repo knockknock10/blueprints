@@ -1,0 +1,423 @@
+id: https-redirect-chain-downgrade-gate
+namespace: company.infrastructure
+description: |
+  Trace a real HTTP redirect chain one response at a time, recording every status and
+  Location target. Detect HTTPS-to-HTTP downgrades, excessive redirect hops, failed
+  destinations, and redirects into non-public address space. The report supports an
+  audit-only mode and a strict gate mode; redirects are resolved from live responses,
+  not inferred from a single final URL.
+
+inputs:
+  - id: target_url
+    type: STRING
+    displayName: Initial URL
+    defaults: https://httpbin.org/redirect/2
+    description: HTTP(S) URL to probe. Redirect destinations are checked before following them.
+  - id: maximum_redirects
+    type: INT
+    displayName: Maximum redirects
+    defaults: 8
+    description: Maximum number of redirects to follow, from 0 to 20.
+  - id: require_https_final
+    type: BOOL
+    displayName: Require final HTTPS
+    defaults: true
+    description: Require the final destination to use HTTPS.
+  - id: forbid_https_downgrade
+    type: BOOL
+    displayName: Forbid HTTPS downgrade
+    defaults: true
+    description: Flag any redirect from HTTPS to HTTP.
+  - id: strict_mode
+    type: BOOL
+    displayName: Enforce redirect policy
+    defaults: false
+    description: When true, policy violations are blocking findings and fail the flow; otherwise violations are reported as warnings.
+  - id: notify_slack
+    type: BOOL
+    displayName: Send Slack alerts
+    defaults: false
+    description: Enable only after configuring SLACK_WEBHOOK_URL in the Kestra namespace.
+  - id: archive_report
+    type: BOOL
+    displayName: Archive report to S3
+    defaults: false
+    description: Store the JSON redirect-chain report in S3. AWS credentials are required only when enabled.
+  - id: evidence_bucket
+    type: STRING
+    displayName: S3 evidence bucket
+    defaults: my-redirect-chain-audit
+    description: Existing S3 bucket used only when report archival is enabled.
+  - id: evidence_prefix
+    type: STRING
+    displayName: S3 evidence prefix
+    defaults: https-redirect-chain-audits
+    description: Prefix for endpoint redirect audit reports.
+  - id: aws_region
+    type: STRING
+    displayName: AWS region
+    defaults: eu-west-1
+    description: Region containing the evidence bucket.
+
+triggers:
+  - id: weekday_redirect_audit
+    type: io.kestra.plugin.core.trigger.Schedule
+    description: Recheck the endpoint redirect chain every weekday. Enable after confirming the destination and desired enforcement policy.
+    cron: "0 8 * * 1-5"
+    disabled: true
+
+tasks:
+  - id: validate_configuration
+    type: io.kestra.plugin.scripts.python.Script
+    description: Validate the target URL and hop limit before making requests.
+    containerImage: python:3.12-slim
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+    env:
+      TARGET_URL: "{{ inputs.target_url }}"
+      MAXIMUM_REDIRECTS: "{{ inputs.maximum_redirects }}"
+    script: |
+      import os
+      from urllib.parse import urlsplit
+
+      raw = os.environ.get("TARGET_URL", "").strip()
+      parsed = urlsplit(raw)
+      if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username or parsed.password:
+          raise ValueError("target_url must be an HTTP(S) URL without embedded credentials")
+      if parsed.fragment:
+          raise ValueError("target_url must not include a fragment")
+      try:
+          maximum_redirects = int(os.environ.get("MAXIMUM_REDIRECTS", "8"))
+      except ValueError as exc:
+          raise ValueError("maximum_redirects must be an integer") from exc
+      if not 0 <= maximum_redirects <= 20:
+          raise ValueError("maximum_redirects must be between 0 and 20")
+      print(f"Validated redirect probe URL {parsed.scheme}://{parsed.netloc}; maximum redirects={maximum_redirects}")
+
+  - id: inspect_redirect_chain
+    type: io.kestra.plugin.scripts.python.Script
+    description: Perform bounded GET requests with redirect following disabled, validate each redirect target, and record HTTPS downgrades and final status.
+    containerImage: python:3.12-slim
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+    dependencies:
+      - kestra
+    env:
+      TARGET_URL: "{{ inputs.target_url }}"
+      MAXIMUM_REDIRECTS: "{{ inputs.maximum_redirects }}"
+      REQUIRE_HTTPS_FINAL: "{{ inputs.require_https_final }}"
+      FORBID_HTTPS_DOWNGRADE: "{{ inputs.forbid_https_downgrade }}"
+      STRICT_MODE: "{{ inputs.strict_mode }}"
+    outputFiles:
+      - redirect-chain-report.json
+    script: |
+      import ipaddress
+      import json
+      import os
+      import socket
+      from datetime import datetime, timezone
+      from urllib.error import HTTPError, URLError
+      from urllib.parse import urljoin, urlsplit
+      from urllib.request import HTTPRedirectHandler, Request, build_opener
+      from kestra import Kestra
+
+      target_url = os.environ["TARGET_URL"].strip()
+      maximum_redirects = int(os.environ.get("MAXIMUM_REDIRECTS", "8"))
+      require_https_final = os.environ.get("REQUIRE_HTTPS_FINAL", "true").lower() == "true"
+      forbid_https_downgrade = os.environ.get("FORBID_HTTPS_DOWNGRADE", "true").lower() == "true"
+      strict_mode = os.environ.get("STRICT_MODE", "false").lower() == "true"
+      findings = []
+      chain = []
+
+      class NoRedirect(HTTPRedirectHandler):
+          def redirect_request(self, req, fp, code, msg, headers, newurl):
+              return None
+
+      opener = build_opener(NoRedirect())
+
+      def add(code, message):
+          findings.append({
+              "code": code,
+              "severity": "BLOCK" if strict_mode else "WARN",
+              "message": message,
+          })
+
+      def validate_public_url(url):
+          parsed = urlsplit(url)
+          if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+              raise ValueError("redirect destination must be an absolute HTTP(S) URL")
+          if parsed.username or parsed.password:
+              raise ValueError("redirect destination embeds credentials")
+          host = parsed.hostname.rstrip(".")
+          try:
+              literal = ipaddress.ip_address(host)
+              addresses = {literal}
+          except ValueError:
+              port = parsed.port or (443 if parsed.scheme == "https" else 80)
+              answers = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+              addresses = {ipaddress.ip_address(answer[4][0]) for answer in answers}
+          if not addresses:
+              raise ValueError("destination hostname did not resolve to any addresses")
+          non_public = [str(address) for address in addresses if not address.is_global]
+          if non_public:
+              raise ValueError("destination resolves to non-public address space: " + ", ".join(sorted(non_public)))
+          return parsed
+
+      current_url = target_url
+      final_status = None
+      final_url = None
+      request_error = None
+      redirects_followed = 0
+
+      for hop_index in range(maximum_redirects + 1):
+          try:
+              current = validate_public_url(current_url)
+              request = Request(current_url, headers={
+                  "User-Agent": "Kestra-HTTPS-Redirect-Chain-Gate/1.0",
+                  "Accept": "text/html,application/json,*/*;q=0.8",
+              }, method="GET")
+              try:
+                  with opener.open(request, timeout=25) as response:
+                      status = response.status
+                      response_headers = response.headers
+                      response_url = response.geturl()
+                      response.read(1024)
+              except HTTPError as exc:
+                  status = exc.code
+                  response_headers = exc.headers
+                  response_url = current_url
+                  try:
+                      exc.read(1024)
+                  except Exception:
+                      pass
+
+              location = response_headers.get("Location")
+              record = {
+                  "hop": hop_index,
+                  "url": current_url,
+                  "scheme": current.scheme,
+                  "httpStatus": status,
+                  "location": location,
+              }
+              chain.append(record)
+              final_status = status
+              final_url = response_url
+
+              if status in {301, 302, 303, 307, 308}:
+                  if not location:
+                      add("REDIRECT_LOCATION_MISSING", f"HTTP {status} response from {current_url} has no Location header.")
+                      break
+                  if redirects_followed >= maximum_redirects:
+                      add("REDIRECT_LIMIT_EXCEEDED", f"Redirect chain exceeded the configured {maximum_redirects}-hop limit.")
+                      break
+                  next_url = urljoin(current_url, location)
+                  next_parts = urlsplit(next_url)
+                  validate_public_url(next_url)
+                  if current.scheme == "https" and next_parts.scheme == "http" and forbid_https_downgrade:
+                      add("HTTPS_DOWNGRADE", f"Redirect downgrades from HTTPS to HTTP: {current_url} -> {next_url}")
+                  current_url = next_url
+                  redirects_followed += 1
+                  continue
+
+              if status < 200 or status >= 300:
+                  add("FINAL_STATUS_NOT_SUCCESSFUL", f"Final response from {current_url} returned HTTP {status}.")
+              if require_https_final and urlsplit(current_url).scheme != "https":
+                  add("FINAL_DESTINATION_NOT_HTTPS", f"Final destination is not HTTPS: {current_url}")
+              break
+
+          except Exception as exc:
+              request_error = str(exc)
+              add("REDIRECT_PROBE_FAILED", f"Could not safely inspect redirect destination {current_url}: {exc}")
+              break
+
+      if final_url is None:
+          final_url = current_url
+
+      blocking = [item for item in findings if item["severity"] == "BLOCK"]
+      warnings = [item for item in findings if item["severity"] == "WARN"]
+      verdict = "FAIL" if blocking else ("PASS_WITH_WARNINGS" if warnings else "PASS")
+      report = {
+          "schemaVersion": 1,
+          "checkedAt": datetime.now(timezone.utc).isoformat(),
+          "initialUrl": target_url,
+          "finalUrl": final_url,
+          "finalHttpStatus": final_status,
+          "redirectsFollowed": redirects_followed,
+          "maximumRedirects": maximum_redirects,
+          "requireHttpsFinal": require_https_final,
+          "forbidHttpsDowngrade": forbid_https_downgrade,
+          "strictMode": strict_mode,
+          "chain": chain,
+          "findings": findings,
+          "blockingFindingCount": len(blocking),
+          "warningCount": len(warnings),
+          "verdict": verdict,
+          "requestError": request_error,
+          "scopeNote": "The probe performs GET requests, inspects response redirects and validates public destination addresses before each request. Network-layer DNS rebinding cannot be completely ruled out by a separate pre-resolution check; this is an operational redirect audit, not a hardened egress firewall.",
+      }
+      with open("redirect-chain-report.json", "w", encoding="utf-8") as target:
+          json.dump(report, target, indent=2, ensure_ascii=False)
+
+      print(f"HTTPS redirect chain audit: target={target_url}, hops={redirects_followed}, final_status={final_status}, final_url={final_url}, strict={strict_mode}, verdict={verdict}, blocking={len(blocking)}, warnings={len(warnings)}")
+      print("Redirect chain findings: " + json.dumps(findings, ensure_ascii=False))
+      Kestra.outputs({
+          "initial_url": target_url,
+          "final_url": final_url,
+          "final_http_status": final_status,
+          "redirects_followed": redirects_followed,
+          "blocking_finding_count": len(blocking),
+          "warning_count": len(warnings),
+          "verdict": verdict,
+          "findings": findings,
+      })
+
+  - id: optionally_archive_report
+    type: io.kestra.plugin.core.flow.If
+    description: Optionally archive the redirect chain and findings to S3.
+    condition: "{{ inputs.archive_report }}"
+    then:
+      - id: upload_redirect_report
+        type: io.kestra.plugin.aws.s3.Upload
+        description: Store the JSON redirect-chain report for compliance evidence.
+        accessKeyId: "{{ secret('AWS_ACCESS_KEY_ID') }}"
+        secretKeyId: "{{ secret('AWS_SECRET_ACCESS_KEY') }}"
+        region: "{{ inputs.aws_region }}"
+        bucket: "{{ inputs.evidence_bucket }}"
+        from: "{{ outputs.inspect_redirect_chain.outputFiles['redirect-chain-report.json'] }}"
+        key: "{{ inputs.evidence_prefix }}/redirect-chain-{{ execution.id }}.json"
+
+  - id: enforce_redirect_policy
+    type: io.kestra.plugin.core.flow.If
+    description: Fail only when strict mode is enabled and the redirect audit has blocking findings.
+    condition: "{{ inputs.strict_mode and outputs.inspect_redirect_chain.vars.verdict == 'FAIL' }}"
+    then:
+      - id: optionally_alert_redirect_failure
+        type: io.kestra.plugin.core.flow.If
+        description: Send an alert only when enabled and the webhook secret is configured.
+        condition: "{{ inputs.notify_slack }}"
+        then:
+          - id: alert_redirect_failure
+            type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+            description: Alert the endpoint owner about redirect-policy violations.
+            url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+            payload: |-
+              {{
+                {
+                  "text": ":warning: HTTPS redirect policy BLOCKED\nInitial URL: " ~ inputs.target_url ~
+                    "\nFinal URL: " ~ outputs.inspect_redirect_chain.vars.final_url ~
+                    "\nFindings: " ~ (outputs.inspect_redirect_chain.vars.findings | toJson) ~
+                    "\nExecution: " ~ execution.id ~
+                    "\nReview redirect-chain-report.json before relying on the redirect destination."
+                } | toJson
+              }}
+      - id: fail_redirect_gate
+        type: io.kestra.plugin.core.execution.Fail
+        description: Stop downstream promotion after strict redirect policy violations.
+        errorMessage: "HTTPS redirect-chain policy failed for {{ inputs.target_url }}. Review redirect-chain-report.json."
+    else:
+      - id: log_redirect_verdict
+        type: io.kestra.plugin.core.log.Log
+        level: INFO
+        message: "HTTPS redirect-chain audit {{ outputs.inspect_redirect_chain.vars.verdict }} for {{ inputs.target_url }}; redirects={{ outputs.inspect_redirect_chain.vars.redirects_followed }}, final={{ outputs.inspect_redirect_chain.vars.final_url }}."
+
+errors:
+  - id: optionally_alert_execution_failure
+    type: io.kestra.plugin.core.flow.If
+    description: Send technical execution failure notifications only when enabled.
+    condition: "{{ inputs.notify_slack }}"
+    then:
+      - id: alert_execution_failure
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        description: Alert when network or orchestration failures prevent an audit.
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        payload: |-
+          {{
+            {
+              "text": ":warning: HTTPS redirect-chain audit execution failed\nTarget: " ~ inputs.target_url ~
+                "\nExecution: " ~ execution.id ~
+                "\nInspect Kestra logs; execution failure is not a passing redirect-policy result."
+            } | toJson
+          }}
+
+outputs:
+  - id: redirect_chain_audit
+    type: JSON
+    description: Machine-readable redirect hops, final HTTP status, downgrade findings, and configured policy verdict.
+    value: "{{ outputs.inspect_redirect_chain.vars | toJson }}"
+
+extend:
+  title: HTTPS Redirect Chain and Downgrade Gate
+  metaTitle: HTTPS Redirect Chain and Downgrade Gate | Kestra
+  shortDescription: Trace live HTTP redirects, detect HTTPS downgrades and excessive hops, and validate public redirect destinations before release.
+  metaDescription: Inspect real HTTP redirect chains for HTTPS downgrade, excessive hops, failed final responses and redirects into non-public addresses.
+  description: |
+    Trace HTTP redirects one response at a time before a URL is added to an application, callback allowlist or release workflow. The flow records each status and Location header, checks every destination resolves to public address space, detects HTTPS-to-HTTP downgrades, and enforces a configurable redirect-hop cap and final-HTTPS requirement. A JSON report captures the full chain. Audit-only mode reports findings; strict mode can block a deployment.
+
+    ## How it works
+
+    1. Validate the initial URL and configured redirect-hop limit.
+    2. Resolve the destination host and reject non-public addresses before each request.
+    3. Issue a GET request with automatic redirect following disabled, record the status and Location header, and resolve the next URL explicitly.
+    4. Detect HTTPS-to-HTTP transitions, missing Location headers, failed final statuses and excessive hops.
+    5. Write the redirect-chain report and optionally archive or alert on strict-policy failures.
+
+    ## What you get
+
+    - An ordered record of redirect URLs, HTTP statuses and Location values.
+    - Detection of HTTPS downgrades and unexpected final destinations.
+    - A configurable redirect-hop cap and final HTTPS requirement.
+    - A check against redirects into private, loopback, link-local or other non-public IP address space.
+    - Optional S3 evidence, Slack alerts and strict-mode release enforcement.
+
+    ## Who it's for
+
+    - Application teams reviewing login, OAuth callback and download redirects.
+    - Platform and security teams auditing public service endpoints.
+    - Release engineering teams checking redirect destinations before allowing URLs in configuration.
+
+    ## Why orchestrate this with Kestra
+
+    Kestra makes redirect-chain inspection repeatable and observable, stores the ordered result with the execution, and lets teams use a report-first workflow before enabling a strict promotion gate.
+
+    ## Prerequisites
+
+    - Kestra 2.x workers with Docker enabled for the Python Script task runner.
+    - Network access to the target host and any public redirect destinations.
+    - Optional Slack incoming webhook and optional S3 bucket with write access.
+    - Use an approved public endpoint. The DNS pre-check does not replace an enforced network egress policy.
+
+    ### Secrets
+
+    - SLACK_WEBHOOK_URL: optional Slack incoming webhook; required only when notify_slack is true.
+    - AWS_ACCESS_KEY_ID: optional AWS access key used only when report archival is enabled.
+    - AWS_SECRET_ACCESS_KEY: optional AWS secret key used only when report archival is enabled.
+
+    ## Quick start
+
+    1. Import the flow and run the default httpbin redirect endpoint to see a real multi-hop chain.
+    2. Review the chain, final HTTP status and redirect-chain-report.json output.
+    3. Adjust maximum_redirects, require_https_final and forbid_https_downgrade to match the service policy.
+    4. Run in audit mode first; enable strict_mode only after reviewing legitimate cross-domain redirect behavior.
+    5. Enable the schedule and optional integrations after checking the first report.
+
+    ## How to extend
+
+    - Add an approved-host allowlist for login, identity and download redirect destinations.
+    - Add a required final-host policy for OAuth callbacks or signed-download services.
+    - Compare redirect-chain fingerprints across staging and production to spot unexpected routing drift.
+    - Combine this check with HTTP security headers and DNS validation for a broader endpoint posture report.
+
+    ## Links
+
+    - [HTTP Semantics: Redirection](https://www.rfc-editor.org/rfc/rfc9110.html#name-redirection-3xx)
+    - [OWASP Unvalidated Redirects and Forwards](https://cheatsheetseries.owasp.org/cheatsheets/Unvalidated_Redirects_and_Forwards_Cheat_Sheet.html)
+    - [Kestra Python Script plugin](https://kestra.io/plugins/plugin-scripts/python)
+    - [Kestra Slack Incoming Webhook plugin](https://kestra.io/plugins/plugin-slack/slackincomingwebhook)
+    - [Kestra AWS S3 plugin](https://kestra.io/plugins/plugin-aws/s3)
+  tags:
+    - Infrastructure
+  subTags:
+    - Policy & Compliance
+    - Monitoring & Alerting
+  ee: false
+  demo: false
